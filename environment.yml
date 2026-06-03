@@ -11,3 +11,5 @@ dependencies:
     - timm
     - diffusers
     - accelerate
+    - transformers
+    - sentencepiece

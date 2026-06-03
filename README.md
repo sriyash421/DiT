@@ -85,6 +85,41 @@ one node:
 torchrun --nnodes=1 --nproc_per_node=N train.py --model DiT-XL/2 --data-path /path/to/imagenet/train
 ```
 
+## CLEVR Text-Conditioned Fine-Tuning
+
+This fork also supports fine-tuning `DiT-XL/2` on 3-object CLEVR images with frozen FLAN-T5 caption embeddings.
+
+```bash
+python preprocess_clevr_dit_dataset.py \
+  --clevr-root /gpfs/scrubbed/sriyash/CLEVRDataset/CLEVR_v1.0 \
+  --out /gpfs/scrubbed/sriyash/clevr_dit_dataset \
+  --num-objects 3
+```
+
+```bash
+python preprocess_clevr_text_embeddings.py \
+  --dataset /gpfs/scrubbed/sriyash/clevr_dit_dataset \
+  --encoder google/flan-t5-large \
+  --templates chain order compact \
+  --max-length 128 \
+  --batch-size 32
+```
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N train_text.py \
+  --data-path /gpfs/scrubbed/sriyash/clevr_dit_dataset \
+  --model DiT-XL/2 \
+  --image-size 256 \
+  --vae mse \
+  --global-batch-size 256
+```
+
+```bash
+python sample_text.py \
+  --ckpt /path/to/text_dit_checkpoint.pt \
+  --caption "objects: small gray metal sphere, large yellow metal sphere, large blue rubber cube. horizontal: yellow sphere is right of blue cube, gray sphere is right of yellow sphere. depth: gray sphere is behind yellow sphere, blue cube is behind gray sphere."
+```
+
 ### PyTorch Training Results
 
 We've trained DiT-XL/2 and DiT-B/4 models from scratch with the PyTorch training script

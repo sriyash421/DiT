@@ -82,6 +82,10 @@ samples/
 *.pth
 *.safetensors
 sample*.png
+sample_text.png
+clevr_*_caption_examples.png
 
 pretrained_models
 sample.png
+
+results

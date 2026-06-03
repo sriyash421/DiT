@@ -158,6 +158,9 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        text_conditioning=False,
+        text_embed_dim=1024,
+        max_text_len=128,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -165,10 +168,19 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.text_conditioning = text_conditioning
+        self.max_text_len = max_text_len
+        self.class_dropout_prob = class_dropout_prob
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        if text_conditioning:
+            self.text_token_proj = nn.Linear(text_embed_dim, hidden_size)
+            self.text_pool_proj = nn.Linear(text_embed_dim, hidden_size)
+            self.null_text_tokens = nn.Parameter(torch.zeros(1, max_text_len, text_embed_dim))
+            self.null_text_pooled = nn.Parameter(torch.zeros(1, text_embed_dim))
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -200,6 +212,12 @@ class DiT(nn.Module):
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
+        if self.text_conditioning:
+            nn.init.xavier_uniform_(self.text_token_proj.weight)
+            nn.init.constant_(self.text_token_proj.bias, 0)
+            nn.init.xavier_uniform_(self.text_pool_proj.weight)
+            nn.init.constant_(self.text_pool_proj.bias, 0)
+
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -230,19 +248,64 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def prepare_text_conditioning(self, text_tokens, text_pooled, text_mask=None, force_drop_text=None):
+        """
+        Applies text dropout for CFG and projects frozen text encoder embeddings
+        into the DiT hidden space.
+        """
+        assert self.text_conditioning, "Text inputs require text_conditioning=True."
+        assert text_tokens is not None and text_pooled is not None, "Text conditioning needs token and pooled embeddings."
+        bsz, text_len, _ = text_tokens.shape
+        assert text_len <= self.max_text_len, f"text_len={text_len} exceeds max_text_len={self.max_text_len}"
+
+        if force_drop_text is None:
+            if self.training and self.class_dropout_prob > 0:
+                drop_ids = torch.rand(bsz, device=text_tokens.device) < self.class_dropout_prob
+            else:
+                drop_ids = torch.zeros(bsz, device=text_tokens.device, dtype=torch.bool)
+        else:
+            drop_ids = force_drop_text.to(device=text_tokens.device).bool()
+
+        null_tokens = self.null_text_tokens[:, :text_len].to(dtype=text_tokens.dtype, device=text_tokens.device)
+        null_tokens = null_tokens.expand(bsz, -1, -1)
+        null_pooled = self.null_text_pooled.to(dtype=text_pooled.dtype, device=text_pooled.device).expand(bsz, -1)
+        text_tokens = torch.where(drop_ids[:, None, None], null_tokens, text_tokens)
+        text_pooled = torch.where(drop_ids[:, None], null_pooled, text_pooled)
+
+        text_tokens = self.text_token_proj(text_tokens)
+        if text_mask is not None:
+            text_tokens = text_tokens * text_mask.to(device=text_tokens.device, dtype=text_tokens.dtype).unsqueeze(-1)
+        text_pooled = self.text_pool_proj(text_pooled)
+        return text_tokens, text_pooled
+
+    def forward(self, x, t, y=None, text_tokens=None, text_mask=None, text_pooled=None, force_drop_text=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: (N,) tensor of class labels, unless text embeddings are provided
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        if text_tokens is not None:
+            text_tokens, text_pooled = self.prepare_text_conditioning(
+                text_tokens=text_tokens,
+                text_pooled=text_pooled,
+                text_mask=text_mask,
+                force_drop_text=force_drop_text,
+            )
+            x = torch.cat([text_tokens, x], dim=1)
+            text_len = text_tokens.shape[1]
+            c = t + text_pooled
+        else:
+            assert y is not None, "Class-conditional forward requires y when text inputs are absent."
+            y = self.y_embedder(y, self.training)    # (N, D)
+            c = t + y                                # (N, D)
+            text_len = 0
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
+        if text_len:
+            x = x[:, text_len:]
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
@@ -259,6 +322,31 @@ class DiT(nn.Module):
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
         # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+    def forward_with_text_cfg(self, x, t, text_tokens, text_mask, text_pooled, cfg_scale):
+        """
+        Text-conditioned classifier-free guidance. The incoming batch is expected
+        to contain conditional rows followed by unconditional rows.
+        """
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        force_drop_text = torch.cat([
+            torch.zeros(len(half), device=x.device, dtype=torch.bool),
+            torch.ones(len(half), device=x.device, dtype=torch.bool),
+        ], dim=0)
+        model_out = self.forward(
+            combined,
+            t,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            text_pooled=text_pooled,
+            force_drop_text=force_drop_text,
+        )
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
