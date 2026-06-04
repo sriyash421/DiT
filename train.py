@@ -13,7 +13,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -30,6 +30,28 @@ import os
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from download import find_model
+
+
+class UnconditionalImageDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        self.paths = sorted(
+            path for path in glob(f"{root}/**/*.png", recursive=True)
+            if os.path.isfile(path)
+        )
+        if not self.paths:
+            raise FileNotFoundError(f"No readable PNG images found under {root}")
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.paths[idx]).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, torch.tensor(0, dtype=torch.long)
 
 
 #################################################################################
@@ -103,6 +125,14 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+def load_model_checkpoint(model, ckpt_path, logger):
+    state_dict = find_model(ckpt_path)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    logger.info(f"Loaded checkpoint {ckpt_path}")
+    logger.info(f"Missing keys: {missing}")
+    logger.info(f"Unexpected keys: {unexpected}")
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -143,16 +173,22 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     )
+    if args.unconditional:
+        logger.info(f"Training in unconditional mode with all labels forced to null class {args.num_classes}.")
+    if args.ckpt is not None:
+        load_model_checkpoint(model, args.ckpt, logger)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = AutoencoderKL.from_pretrained(args.vae).to(device)
+    vae_scaling_factor = vae.config.scaling_factor
+    logger.info(f"Loaded VAE {args.vae} with scaling_factor={vae_scaling_factor}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -161,7 +197,10 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    if args.unconditional:
+        dataset = UnconditionalImageDataset(args.data_path, transform=transform)
+    else:
+        dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -198,17 +237,21 @@ def main(args):
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
+            if args.unconditional:
+                y = torch.full_like(y, args.num_classes)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                x = vae.encode(x).latent_dist.sample().mul_(vae_scaling_factor)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model.module, decay=args.ema_decay)
 
             # Log loss values:
             running_loss += loss.item()
@@ -261,9 +304,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument("--unconditional", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     args = parser.parse_args()
     main(args)

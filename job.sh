@@ -5,15 +5,22 @@
 #SBATCH --gpus=2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=480G
-#SBATCH --time=24:00:00
-#SBATCH --output=/gpfs/projects/weirdlab/sriyash/DiT/slurm-%x-%j.out
+#SBATCH --time=6:00:00
+#SBATCH --output=/gpfs/projects/weirdlab/sriyash/DiT/results/slurm-%x-%j.out
 
 cd /gpfs/projects/weirdlab/sriyash/DiT
 
-/gpfs/scrubbed/sriyash/conda/DiT/bin/torchrun --nnodes=1 --nproc_per_node=2 train_text.py \
+# module load conda
+# conda activate DiT
+source .venv/bin/activate
+torchrun --nnodes=1 --nproc_per_node=2 train_text.py \
   --data-path /gpfs/scrubbed/sriyash/clevr_dit_dataset \
   --model DiT-XL/2 \
   --image-size 256 \
   --vae mse \
-  --global-batch-size 8 \
-  --num-workers 8
+  --global-batch-size 128 \
+  --num-workers 8 \
+  --results-dir /gpfs/scrubbed/sriyash/DiT-clevr-results \
+  --lr 1e-5 \
+  --grad-clip 1.0 \
+  --ckpt-every 1000

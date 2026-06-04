@@ -26,6 +26,7 @@ from diffusion import create_diffusion
 from download import find_model
 from models import DiT_models
 
+import wandb
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -59,6 +60,12 @@ def create_logger(logging_dir):
     return logger
 
 
+def save_checkpoint_atomic(checkpoint, checkpoint_path):
+    tmp_path = f"{checkpoint_path}.tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, checkpoint_path)
+
+
 def center_crop_arr(pil_image, image_size):
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
@@ -90,6 +97,11 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        wandb.init(
+            project=args.wandb_project,
+            name=os.path.basename(experiment_dir),
+            config=vars(args),
+        )
     else:
         logger = create_logger(None)
 
@@ -144,6 +156,7 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_grad_norm = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -164,10 +177,12 @@ def main(args):
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             update_ema(ema, model.module)
 
             running_loss += loss.item()
+            running_grad_norm += grad_norm.item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -175,10 +190,21 @@ def main(args):
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                avg_grad_norm = torch.tensor(running_grad_norm / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_grad_norm, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_grad_norm = avg_grad_norm.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Grad Norm: {avg_grad_norm:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if rank == 0:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/grad_norm": avg_grad_norm,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/epoch": epoch,
+                    }, step=train_steps)
                 running_loss = 0
+                running_grad_norm = 0
                 log_steps = 0
                 start_time = time()
 
@@ -191,8 +217,11 @@ def main(args):
                         "args": args,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
+                    save_checkpoint_atomic(checkpoint, checkpoint_path)
+                    sample_checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}-ema.pt"
+                    save_checkpoint_atomic(ema.state_dict(), sample_checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    logger.info(f"Saved EMA checkpoint to {sample_checkpoint_path}")
                 dist.barrier()
 
             if args.max_train_steps is not None and train_steps >= args.max_train_steps:
@@ -202,6 +231,8 @@ def main(args):
             break
 
     logger.info("Done!")
+    if rank == 0:
+        wandb.finish()
     cleanup()
 
 
@@ -218,11 +249,13 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt-every", type=int, default=10_000)
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--text-embed-dim", type=int, default=1024)
     parser.add_argument("--max-text-len", type=int, default=128)
+    parser.add_argument("--wandb-project", type=str, default="DiT-text")
     main(parser.parse_args())

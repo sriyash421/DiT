@@ -63,7 +63,8 @@ def main(args):
         text_embed_dim=args.text_embed_dim,
         max_text_len=args.max_text_len,
     ).to(device)
-    state_dict = find_model(args.ckpt)
+    # state_dict = find_model(args.ckpt)
+    state_dict = torch.load(args.ckpt)["model"]
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     diffusion = create_diffusion(str(args.num_sampling_steps))
