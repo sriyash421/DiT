@@ -114,19 +114,30 @@ def main(args):
         text_embed_dim=args.text_embed_dim,
         max_text_len=args.max_text_len,
     )
-    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    logger.info(f"Loaded checkpoint {ckpt_path}")
-    logger.info(f"Missing keys: {missing}")
-    logger.info(f"Unexpected keys: {unexpected}")
+    if not args.from_scratch:
+        ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+        state_dict = find_model(ckpt_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        logger.info(f"Loaded checkpoint {ckpt_path}")
+        logger.info(f"Missing keys: {missing}")
+        logger.info(f"Unexpected keys: {unexpected}")
+    elif args.ckpt is not None:
+        state_dict = find_model(args.ckpt)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        logger.info(f"Loaded checkpoint {args.ckpt}")
+        logger.info(f"Missing keys: {missing}")
+        logger.info(f"Unexpected keys: {unexpected}")
+    else:
+        logger.info("Training from scratch.")
     requires_grad(model.y_embedder, False)
 
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
     diffusion = create_diffusion(timestep_respacing="")
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = AutoencoderKL.from_pretrained(args.vae).to(device)
+    vae_scaling_factor = vae.config.scaling_factor
+    logger.info(f"Loaded VAE {args.vae} with scaling_factor={vae_scaling_factor}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0)
@@ -170,7 +181,7 @@ def main(args):
             text_mask = batch["text_mask"].to(device)
             text_pooled = batch["text_pooled"].to(device)
             with torch.no_grad():
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                x = vae.encode(x).latent_dist.sample().mul_(vae_scaling_factor)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(text_tokens=text_tokens, text_mask=text_mask, text_pooled=text_pooled)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -179,7 +190,7 @@ def main(args):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model.module, decay=args.ema_decay)
 
             running_loss += loss.item()
             running_grad_norm += grad_norm.item()
@@ -246,15 +257,17 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
+    parser.add_argument("--vae", type=str, default="stabilityai/sdxl-vae")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=10_000)
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--from-scratch", action="store_true")
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--text-embed-dim", type=int, default=1024)
     parser.add_argument("--max-text-len", type=int, default=128)
     parser.add_argument("--wandb-project", type=str, default="DiT-text")

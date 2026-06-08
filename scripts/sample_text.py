@@ -63,28 +63,40 @@ def main(args):
         text_embed_dim=args.text_embed_dim,
         max_text_len=args.max_text_len,
     ).to(device)
-    # state_dict = find_model(args.ckpt)
-    state_dict = torch.load(args.ckpt)["model"]
+    checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and ("ema" in checkpoint or "model" in checkpoint):
+        key = "ema" if args.ema and "ema" in checkpoint else "model"
+        state_dict = checkpoint[key]
+    else:
+        state_dict = checkpoint
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = AutoencoderKL.from_pretrained(args.vae).to(device)
+    vae_scaling_factor = vae.config.scaling_factor
 
     text_tokens, text_mask, text_pooled = encode_caption(caption, args.encoder, args.max_text_len, device)
-    text_tokens = text_tokens.repeat(args.num_samples * 2, 1, 1)
-    text_mask = text_mask.repeat(args.num_samples * 2, 1)
-    text_pooled = text_pooled.repeat(args.num_samples * 2, 1)
-
     z = torch.randn(args.num_samples, 4, latent_size, latent_size, device=device)
-    z = torch.cat([z, z], 0)
-    model_kwargs = dict(
-        text_tokens=text_tokens,
-        text_mask=text_mask,
-        text_pooled=text_pooled,
-        cfg_scale=args.cfg_scale,
-    )
+    if args.cfg_scale <= 1:
+        text_tokens = text_tokens.repeat(args.num_samples, 1, 1)
+        text_mask = text_mask.repeat(args.num_samples, 1)
+        text_pooled = text_pooled.repeat(args.num_samples, 1)
+        model_kwargs = dict(text_tokens=text_tokens, text_mask=text_mask, text_pooled=text_pooled)
+        forward_fn = model.forward
+    else:
+        z = torch.cat([z, z], 0)
+        text_tokens = text_tokens.repeat(args.num_samples * 2, 1, 1)
+        text_mask = text_mask.repeat(args.num_samples * 2, 1)
+        text_pooled = text_pooled.repeat(args.num_samples * 2, 1)
+        model_kwargs = dict(
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            text_pooled=text_pooled,
+            cfg_scale=args.cfg_scale,
+        )
+        forward_fn = model.forward_with_text_cfg
     samples = diffusion.p_sample_loop(
-        model.forward_with_text_cfg,
+        forward_fn,
         z.shape,
         z,
         clip_denoised=False,
@@ -92,8 +104,9 @@ def main(args):
         progress=True,
         device=device,
     )
-    samples, _ = samples.chunk(2, dim=0)
-    samples = vae.decode(samples / 0.18215).sample
+    if args.cfg_scale > 1:
+        samples, _ = samples.chunk(2, dim=0)
+    samples = vae.decode(samples / vae_scaling_factor).sample
     save_image(samples, args.out, nrow=args.nrow, normalize=True, value_range=(-1, 1))
     print(f"Caption: {caption}")
     print(f"Saved {args.out}")
@@ -102,10 +115,10 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
+    parser.add_argument("--vae", type=str, default="stabilityai/sdxl-vae")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, required=True)
@@ -119,6 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--nrow", type=int, default=4)
     parser.add_argument("--out", type=str, default="sample_text.png")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     if args.caption is None and args.metadata is None:
         raise ValueError("Provide either --caption or --metadata.")

@@ -17,10 +17,12 @@ torchrun --nnodes=1 --nproc_per_node=2 train_text.py \
   --data-path /gpfs/scrubbed/sriyash/clevr_dit_dataset \
   --model DiT-XL/2 \
   --image-size 256 \
-  --vae mse \
+  --vae stabilityai/sd-vae-ft-mse \
   --global-batch-size 128 \
   --num-workers 8 \
   --results-dir /gpfs/scrubbed/sriyash/DiT-clevr-results \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-results/003-DiT-XL-2-text/checkpoints/0029000-ema.pt \
   --lr 1e-5 \
   --grad-clip 1.0 \
+  --ema-decay 0.9999 \
   --ckpt-every 1000

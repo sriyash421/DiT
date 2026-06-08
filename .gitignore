@@ -89,3 +89,6 @@ pretrained_models
 sample.png
 
 results
+.agents
+.codex
+*.sh

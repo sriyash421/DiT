@@ -116,7 +116,7 @@ torchrun --nnodes=1 --nproc_per_node=N train_text.py \
 
 ```bash
 python sample_text.py \
-  --ckpt /path/to/text_dit_checkpoint.pt \
+  --ckpt /tmp/dit_0030000_ema_sample.pt \
   --caption "objects: small gray metal sphere, large yellow metal sphere, large blue rubber cube. horizontal: yellow sphere is right of blue cube, gray sphere is right of yellow sphere. depth: gray sphere is behind yellow sphere, blue cube is behind gray sphere."
 ```
 
@@ -196,3 +196,86 @@ This codebase borrows from OpenAI's diffusion repos, most notably [ADM](https://
 
 ## License
 The code and model weights are licensed under CC-BY-NC. See [`LICENSE.txt`](LICENSE.txt) for details.
+
+
+results/slurm-dit_clevr_text-134848.out - pretrained finetune / low lr
+results/slurm-scratch-unconditional-dit_clevr_uncond-134867.out
+134888 -- direct conditioning/text/scratch small model
+https://wandb.ai/sriyash-uw-team/DiT-clevr-text-final/runs/ohbhe9n6
+
+1. Pretrained text fine-tune, train captions, 5x4
+
+python sample_clevr_eval_grid.py \
+  --mode text \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-results/003-DiT-XL-2-text/checkpoints/0029000-ema.pt \
+  --model DiT-XL/2 \
+  --vae stabilityai/sd-vae-ft-mse \
+  --split train \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --caption-seed 0 \
+  --seed 0 \
+  --cfg-scale 1.0 \
+  --num-sampling-steps 250 \
+  --out results/eval_samples/pretrained_text_xl2_0029000_train_5x4.png
+
+2. Pretrained text fine-tune, val captions, 5x4
+
+python sample_clevr_eval_grid.py \
+  --mode text \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-results/003-DiT-XL-2-text/checkpoints/0029000-ema.pt \
+  --model DiT-XL/2 \
+  --vae stabilityai/sd-vae-ft-mse \
+  --split val \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --caption-seed 0 \
+  --seed 0 \
+  --cfg-scale 5.0 \
+  --num-sampling-steps 250 \
+  --out results/eval_samples/pretrained_text_xl2_0029000_val_5x4_5.0.png
+
+3. Scratch text S/4, train captions, 5x4
+
+python sample_clevr_eval_grid.py \
+  --mode text \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
+  --model DiT-S/4 \
+  --vae stabilityai/sdxl-vae \
+  --split train \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --caption-seed 0 \
+  --seed 0 \
+  --cfg-scale 1.0 \
+  --num-sampling-steps 250 \
+  --out results/eval_samples/scratch_text_s4_0100000_train_5x4.png
+
+4. Scratch text S/4, val captions, 5x4
+
+python sample_clevr_eval_grid.py \
+  --mode text \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
+  --model DiT-S/4 \
+  --vae stabilityai/sdxl-vae \
+  --split val \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --caption-seed 0 \
+  --seed 0 \
+  --cfg-scale 1.0 \
+  --num-sampling-steps 250 \
+  --out results/eval_samples/scratch_text_s4_0100000_val_5x4.png
+
+5. Scratch unconditional S/4, random 5x4
+
+python sample_clevr_eval_grid.py \
+  --mode uncond \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-uncond-results/002-DiT-S-4/checkpoints/0096000.pt \
+  --model DiT-S/4 \
+  --vae stabilityai/sdxl-vae \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --seed 0 \
+  --num-sampling-steps 250 \
+  --out results/eval_samples/scratch_uncond_s4_0096000_5x4.png

@@ -283,7 +283,8 @@ class DiT(nn.Module):
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels, unless text embeddings are provided
+        y: (N,) tensor of class labels. If y and text inputs are both absent,
+           the model runs unconditionally with timestep-only conditioning.
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
@@ -298,9 +299,11 @@ class DiT(nn.Module):
             text_len = text_tokens.shape[1]
             c = t + text_pooled
         else:
-            assert y is not None, "Class-conditional forward requires y when text inputs are absent."
-            y = self.y_embedder(y, self.training)    # (N, D)
-            c = t + y                                # (N, D)
+            if y is None:
+                c = t                                # (N, D)
+            else:
+                y = self.y_embedder(y, self.training)    # (N, D)
+                c = t + y                                # (N, D)
             text_len = 0
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
