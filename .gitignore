@@ -93,3 +93,4 @@ results
 .codex
 *.sh
 data
+scripts/adaptive_debug

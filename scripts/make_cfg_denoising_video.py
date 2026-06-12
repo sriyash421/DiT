@@ -153,7 +153,7 @@ def cfg_model_fn(model, text_tokens, text_mask, text_pooled, cfg_scale):
             text_tokens=text_tokens,
             text_mask=text_mask,
             text_pooled=text_pooled,
-            force_drop_text=drop,
+            drop_all_cond=drop,
         )
         # Match the repository CFG path: guide only the RGB/epsilon channels.
         cond_eps, cond_rest = cond[:, :3], cond[:, 3:]

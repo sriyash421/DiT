@@ -172,6 +172,32 @@ def add_caption_rows_with_ground_truth(image_path, captions, image_paths, datase
     out.save(image_path)
 
 
+def maybe_log_to_wandb(args, image_path):
+    if args.wandb_project is None:
+        return
+    import wandb
+
+    run = wandb.init(
+        project=args.wandb_project,
+        id=args.wandb_run_id,
+        name=args.wandb_name,
+        resume=args.wandb_resume,
+        config={
+            "eval_ckpt": args.ckpt,
+            "eval_split": args.split,
+            "eval_template": args.template,
+            "eval_cfg_scale": args.cfg_scale,
+            "eval_num_captions": args.num_captions,
+            "eval_samples_per_caption": args.samples_per_caption,
+            "eval_num_sampling_steps": args.num_sampling_steps,
+            "eval_sampler": args.sampler,
+        },
+    )
+    key = args.wandb_key
+    run.log({key: wandb.Image(str(image_path))}, step=args.wandb_step)
+    run.finish()
+
+
 @torch.no_grad()
 def main(args):
     torch.manual_seed(args.seed)
@@ -271,6 +297,7 @@ def main(args):
         elif args.draw_captions:
             add_caption_rows(out, text_batch["captions"], args.samples_per_caption)
         print(f"Saved captions to {captions_path}")
+    maybe_log_to_wandb(args, out)
     print(f"Saved samples to {out}")
 
 
@@ -298,4 +325,10 @@ if __name__ == "__main__":
     parser.add_argument("--draw-captions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--draw-ground-truth", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-run-id", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-resume", type=str, default="allow")
+    parser.add_argument("--wandb-key", type=str, default="eval/grid")
+    parser.add_argument("--wandb-step", type=int, default=None)
     main(parser.parse_args())

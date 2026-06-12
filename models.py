@@ -248,23 +248,23 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def prepare_text_conditioning(self, text_tokens, text_pooled, text_mask=None, force_drop_text=None):
+    def prepare_text_conditioning(self, text_tokens, text_pooled, text_mask=None, drop_caption=None):
         """
         Applies text dropout for CFG and projects frozen text encoder embeddings
-        into the DiT hidden space.
+        into the DiT hidden space. This path is used for caption conditioning.
         """
         assert self.text_conditioning, "Text inputs require text_conditioning=True."
         assert text_tokens is not None and text_pooled is not None, "Text conditioning needs token and pooled embeddings."
         bsz, text_len, _ = text_tokens.shape
         assert text_len <= self.max_text_len, f"text_len={text_len} exceeds max_text_len={self.max_text_len}"
 
-        if force_drop_text is None:
+        if drop_caption is None:
             if self.training and self.class_dropout_prob > 0:
                 drop_ids = torch.rand(bsz, device=text_tokens.device) < self.class_dropout_prob
             else:
                 drop_ids = torch.zeros(bsz, device=text_tokens.device, dtype=torch.bool)
         else:
-            drop_ids = force_drop_text.to(device=text_tokens.device).bool()
+            drop_ids = drop_caption.to(device=text_tokens.device).bool()
 
         null_tokens = self.null_text_tokens[:, :text_len].to(dtype=text_tokens.dtype, device=text_tokens.device)
         null_tokens = null_tokens.expand(bsz, -1, -1)
@@ -276,69 +276,149 @@ class DiT(nn.Module):
         if text_mask is not None:
             text_tokens = text_tokens * text_mask.to(device=text_tokens.device, dtype=text_tokens.dtype).unsqueeze(-1)
         text_pooled = self.text_pool_proj(text_pooled)
-        return text_tokens, text_pooled
+        return text_tokens, text_pooled, drop_ids
 
-    def forward(self, x, t, y=None, text_tokens=None, text_mask=None, text_pooled=None, force_drop_text=None):
+    def prepare_feedback_tokens(self, feedback_tokens, feedback_mask=None, drop_ids=None):
+        """Project feedback text embeddings with the existing text projection."""
+        if feedback_tokens is None:
+            return None
+        feedback_tokens = self.text_token_proj(feedback_tokens)
+        if feedback_mask is not None:
+            feedback_tokens = feedback_tokens * feedback_mask.to(
+                device=feedback_tokens.device,
+                dtype=feedback_tokens.dtype,
+            ).unsqueeze(-1)
+        if drop_ids is not None:
+            feedback_tokens = torch.where(
+                drop_ids[:, None, None].to(device=feedback_tokens.device),
+                torch.zeros_like(feedback_tokens),
+                feedback_tokens,
+            )
+        return feedback_tokens
+
+    def prepare_attempt_tokens(self, attempt_latent, drop_ids=None):
+        """Patch/project attempted-image VAE latents with the existing x_embedder."""
+        if attempt_latent is None:
+            return None
+        attempt_tokens = self.x_embedder(attempt_latent) + self.pos_embed
+        if drop_ids is not None:
+            attempt_tokens = torch.where(
+                drop_ids[:, None, None].to(device=attempt_tokens.device),
+                torch.zeros_like(attempt_tokens),
+                attempt_tokens,
+            )
+        return attempt_tokens
+
+    def forward(
+        self,
+        x,
+        t,
+        y=None,
+        text_tokens=None,
+        text_mask=None,
+        text_pooled=None,
+        feedback_tokens=None,
+        feedback_mask=None,
+        feedback_pooled=None,
+        attempt_latent=None,
+        drop_all_cond=None,
+        drop_caption=None,
+    ):
         """
         Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels. If y and text inputs are both absent,
-           the model runs unconditionally with timestep-only conditioning.
+        x: target noisy latent. Optional feedback/image context is prepended as
+        transformer context tokens and removed before the final layer.
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
+        target_tokens = self.x_embedder(x) + self.pos_embed
+        t = self.t_embedder(t)
+        context_tokens = []
+
         if text_tokens is not None:
-            text_tokens, text_pooled = self.prepare_text_conditioning(
+            bsz = text_tokens.shape[0]
+            if drop_all_cond is None:
+                if self.training and self.class_dropout_prob > 0:
+                    full_drop_ids = torch.rand(bsz, device=text_tokens.device) < self.class_dropout_prob
+                else:
+                    full_drop_ids = torch.zeros(bsz, device=text_tokens.device, dtype=torch.bool)
+            else:
+                full_drop_ids = drop_all_cond.to(device=text_tokens.device).bool()
+            caption_drop_ids = full_drop_ids
+            if drop_caption is not None:
+                caption_drop_ids = caption_drop_ids | drop_caption.to(device=text_tokens.device).bool()
+            caption_tokens, caption_pooled, drop_ids = self.prepare_text_conditioning(
                 text_tokens=text_tokens,
                 text_pooled=text_pooled,
                 text_mask=text_mask,
-                force_drop_text=force_drop_text,
+                drop_caption=caption_drop_ids,
             )
-            x = torch.cat([text_tokens, x], dim=1)
-            text_len = text_tokens.shape[1]
-            c = t + text_pooled
+            context_tokens.append(caption_tokens)
+            feedback_tokens = self.prepare_feedback_tokens(
+                feedback_tokens=feedback_tokens,
+                feedback_mask=feedback_mask,
+                drop_ids=full_drop_ids,
+            )
+            if feedback_tokens is not None:
+                context_tokens.append(feedback_tokens)
+            attempt_tokens = self.prepare_attempt_tokens(attempt_latent=attempt_latent, drop_ids=full_drop_ids)
+            if attempt_tokens is not None:
+                context_tokens.append(attempt_tokens)
+            c = t + caption_pooled
         else:
+            drop_ids = None
             if y is None:
-                c = t                                # (N, D)
+                c = t
             else:
-                y = self.y_embedder(y, self.training)    # (N, D)
-                c = t + y                                # (N, D)
-            text_len = 0
+                y = self.y_embedder(y, self.training)
+                c = t + y
+
+        context_len = sum(tokens.shape[1] for tokens in context_tokens)
+        if context_tokens:
+            x = torch.cat([*context_tokens, target_tokens], dim=1)
+        else:
+            x = target_tokens
+
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        if text_len:
-            x = x[:, text_len:]
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+            x = block(x, c)
+        if context_len:
+            x = x[:, context_len:]
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
 
-    def forward_with_text_cfg(self, x, t, text_tokens, text_mask, text_pooled, cfg_scale):
+    def forward_with_text_cfg(
+        self,
+        x,
+        t,
+        text_tokens,
+        text_mask,
+        text_pooled,
+        cfg_scale,
+        feedback_tokens=None,
+        feedback_mask=None,
+        feedback_pooled=None,
+        attempt_latent=None,
+        drop_caption=None,
+    ):
         """
-        Text-conditioned classifier-free guidance. The incoming batch is expected
+        Text/adaptive classifier-free guidance. The incoming batch is expected
         to contain conditional rows followed by unconditional rows.
         """
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        force_drop_text = torch.cat([
+        drop_all_cond = torch.cat([
             torch.zeros(len(half), device=x.device, dtype=torch.bool),
             torch.ones(len(half), device=x.device, dtype=torch.bool),
         ], dim=0)
@@ -348,7 +428,12 @@ class DiT(nn.Module):
             text_tokens=text_tokens,
             text_mask=text_mask,
             text_pooled=text_pooled,
-            force_drop_text=force_drop_text,
+            feedback_tokens=feedback_tokens,
+            feedback_mask=feedback_mask,
+            feedback_pooled=feedback_pooled,
+            attempt_latent=attempt_latent,
+            drop_all_cond=drop_all_cond,
+            drop_caption=drop_caption,
         )
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
