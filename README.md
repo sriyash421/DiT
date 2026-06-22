@@ -1,20 +1,36 @@
-## Scalable Diffusion Models with Transformers (DiT)<br>
+# DiT CLEVR
+
+This fork trains DiT on CLEVR latents from the SDXL VAE. The conditioned model uses frozen `Qwen/Qwen3.5-4B` context tokens and cross-attention inside DiT.
+
+The VLM is frozen. Preprocessing caches Qwen hidden states and resized images in `data.zarr`; training does not run Qwen.
+Caption templates are not selected separately in the scripts. Base context preprocessing writes one cached record per standard caption rendering, and training, feedback generation, and eval treat those rendered captions as ordinary data points.
+Training image preprocessing is deterministic: each RGB image is resized to `model.image_size x model.image_size` with bicubic interpolation, converted to a tensor, then normalized to `[-1, 1]` for the SDXL VAE. There is no random crop, center crop, flip, color jitter, or other image augmentation in `train_text.py`.
+
+## Files
+
+- `preprocess_clevr_dit_dataset.py`: filter CLEVR scenes and write `metadata.jsonl`.
+- `preprocess_clevr_context.py`: cache frozen Qwen context tokens and images to `data.zarr`.
+- `scripts/convert_clevr_context_to_zarr.py`: convert older context shard datasets to `data.zarr`.
+- `train_text.py`: train the Qwen-conditioned DiT.
+- `configs/train_base.yaml`: Hydra config for base context training.
+- `configs/train_adaptive.yaml`: Hydra config for base + feedback training.
+- `clevr_transforms.py`: deterministic CLEVR resize/normalize preprocessing.
+- `datasets_clevr.py`: context datasets, collate, and distributed weighted sampler.
+- `vlm_utils.py`: VLM context text, metadata, loading, and encoding helpers.
+- `generate_vlm_feedback_dataset.py`: sample images and collect Gemini feedback.
+- `scripts/sample_clevr_eval_grid.py`: make fixed caption grids from cached context.
+- `scripts/eval_adaptive_feedback_loop.py`: run iterative Gemini feedback eval.
+- `scripts/sample_text.py`: sample from a raw caption by running Qwen online.
 
 ## Setup
 
 ```bash
 uv venv
+source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-## To debug env
-```bash
-python sample.py --image-size 512 --seed 1
-```
-
-## CLEVR Text-Conditioned Fine-Tuning
-
-This fork also supports fine-tuning `DiT-XL/2` on 3-object CLEVR images with frozen FLAN-T5 caption embeddings.
+## 1. Build CLEVR Rows
 
 ```bash
 python preprocess_clevr_dit_dataset.py \
@@ -23,236 +39,137 @@ python preprocess_clevr_dit_dataset.py \
   --num-objects 3
 ```
 
+## 2. Cache Base Qwen Context
+
 ```bash
-python preprocess_clevr_text_embeddings.py \
+python preprocess_clevr_context.py \
   --dataset /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --encoder google/flan-t5-large \
-  --templates chain order compact \
-  --max-length 128 \
-  --batch-size 32
+  --mode base \
+  --vlm-model Qwen/Qwen3.5-4B \
+  --max-context-len 1024 \
+  --batch-size 4 \
+  --overwrite
 ```
 
+## 3. Train Base Model
+
 ```bash
-torchrun --nnodes=1 --nproc_per_node=2 train_text.py \
-  --data-path /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --results-dir /gpfs/scrubbed/sriyash/DiT-clevr-text-final \
-  --model DiT-S/4 \
-  --image-size 256 \
-  --vae stabilityai/sdxl-vae \
-  --from-scratch \
-  --global-batch-size 128 \
-  --num-workers 8 \
-  --lr 3e-4 \
-  --grad-clip 1.0 \
-  --ema-decay 0.999 \
-  --log-every 100 \
-  --ckpt-every 2000 \
-  --max-train-steps 100000 \
-  --wandb-project DiT-clevr-text-final
+torchrun --nnodes=1 --nproc_per_node=4 train_text.py \
+  --config-name train_base
 ```
 
+Edit `configs/train_base.yaml` or pass Hydra overrides for paths and hyperparameters, for example:
+
 ```bash
-python sample_text.py \
-  --ckpt /tmp/dit_0030000_ema_sample.pt \
-  --caption "objects: small gray metal sphere, large yellow metal sphere, large blue rubber cube. horizontal: yellow sphere is right of blue cube, gray sphere is right of yellow sphere. depth: gray sphere is behind yellow sphere, blue cube is behind gray sphere."
+torchrun --nnodes=1 --nproc_per_node=1 train_text.py \
+  --config-name train_base \
+  train.experiment_name=base_s4_debug \
+  train.max_train_steps=1000 \
+  eval.max_batches_per_dataset=1
 ```
 
-
-## Trained models
-results/slurm-dit_clevr_text-134848.out - pretrained finetune / low lr
-results/slurm-scratch-unconditional-dit_clevr_uncond-134867.out
-134888 -- direct conditioning/text/scratch small model
-https://wandb.ai/sriyash-uw-team/DiT-clevr-text-final/runs/ohbhe9n6
-</br>
-
-## Evaluation
-1. Pretrained text fine-tune, train captions, 5x4
-
-python sample_clevr_eval_grid.py \
-  --mode text \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-results/003-DiT-XL-2-text/checkpoints/0029000-ema.pt \
-  --model DiT-XL/2 \
-  --vae stabilityai/sd-vae-ft-mse \
-  --split train \
-  --num-captions 5 \
-  --samples-per-caption 4 \
-  --caption-seed 0 \
-  --seed 0 \
-  --cfg-scale 1.0 \
-  --num-sampling-steps 250 \
-  --out results/eval_samples/pretrained_text_xl2_0029000_train_5x4.png
-
-2. Pretrained text fine-tune, val captions, 5x4
-
-python sample_clevr_eval_grid.py \
-  --mode text \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-results/003-DiT-XL-2-text/checkpoints/0029000-ema.pt \
-  --model DiT-XL/2 \
-  --vae stabilityai/sd-vae-ft-mse \
-  --split val \
-  --num-captions 5 \
-  --samples-per-caption 4 \
-  --caption-seed 0 \
-  --seed 0 \
-  --cfg-scale 5.0 \
-  --num-sampling-steps 250 \
-  --out results/eval_samples/pretrained_text_xl2_0029000_val_5x4_5.0.png
-
-3. Scratch text S/4, train captions, 5x4
-
-python sample_clevr_eval_grid.py \
-  --mode text \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --split train \
-  --num-captions 5 \
-  --samples-per-caption 4 \
-  --caption-seed 0 \
-  --seed 0 \
-  --cfg-scale 1.0 \
-  --num-sampling-steps 250 \
-  --out results/eval_samples/scratch_text_s4_0100000_train_5x4.png
-
-4. Scratch text S/4, val captions, 5x4
-
-python sample_clevr_eval_grid.py \
-  --mode text \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --split val \
-  --num-captions 5 \
-  --samples-per-caption 4 \
-  --caption-seed 0 \
-  --seed 0 \
-  --cfg-scale 1.0 \
-  --num-sampling-steps 250 \
-  --out results/eval_samples/scratch_text_s4_0100000_val_5x4.png
-
-5. Scratch unconditional S/4, random 5x4
-
-python sample_clevr_eval_grid.py \
-  --mode uncond \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-uncond-results/002-DiT-S-4/checkpoints/0096000.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --num-captions 5 \
-  --samples-per-caption 4 \
-  --seed 0 \
-  --num-sampling-steps 250 \
-  --out results/eval_samples/scratch_uncond_s4_0096000_5x4.png
-
-</br>
-
-# Evaluation metrics
-
-</br>
-
-
-# Hosting VLM Feedback servers
-
-Run these on the GPU node that will host the VLM. The feedback script can run on a different node and call the server with `--vlm-server-url`.
-
-## Qwen2.5-VL-72B via vLLM
+## 4. Generate Gemini Feedback Data
 
 ```bash
-vllm serve Qwen/Qwen2.5-VL-72B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tensor-parallel-size 4 \
-  --limit-mm-per-prompt '{"image": 2}' \
-  --max-model-len 8192
-```
-
-Call it from the feedback script:
-
-```bash
-python scripts/vlm_feedback_clevr.py \
-  --vlm qwen70b \
-  --vlm-server-url http://g001:4000/v1 \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
+python generate_vlm_feedback_dataset.py \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base/base_s4/checkpoints/0100000-ema.pt \
   --model DiT-S/4 \
   --vae stabilityai/sdxl-vae \
-  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --split val \
-  --template chain \
-  --num-examples 10 \
+  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset/data.zarr \
+  --out-dir /gpfs/scrubbed/sriyash/vlm_feedback_dataset_qwen \
+  --max-images 1000 \
+  --samples-per-caption 5 \
+  --feedbacks-per-image 5 \
   --cfg-scale 2.0 \
   --num-sampling-steps 100 \
-  --sampler ddim \
-  --out-dir results/vlm_feedback/qwen70b_hosted
-```
-
-## InternVL3-78B via vLLM
-
-```bash
-vllm serve OpenGVLab/InternVL3-78B \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tensor-parallel-size 4 \
-  --limit-mm-per-prompt '{"image": 2}' \
-  --max-model-len 8192 \
-  --trust-remote-code
-```
-
-Call it from the feedback script:
-
-```bash
-python scripts/vlm_feedback_clevr.py \
-  --vlm intern78b \
-  --vlm-server-url http://HOSTNAME:8000/v1 \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --split val \
-  --template chain \
-  --num-examples 4 \
-  --cfg-scale 1.0 \
-  --num-sampling-steps 50 \
-  --sampler ddim \
-  --out-dir results/vlm_feedback/intern78b_hosted
-```
-
-Replace `HOSTNAME` with the node name or IP where vLLM is running. If the server uses an API key, set `VLLM_API_KEY` or pass `--vlm-server-api-key`.
-
-# Step2: Generating and Training feedback conditioned models
-
-
-## Debugging language feedback pipeline
-
-- Using qwen2.5-VL-7b
-```bash
-python scripts/vlm_feedback_clevr.py \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --split val \
-  --template chain \
-  --num-examples 4 \
-  --cfg-scale 1.0 \
-  --num-sampling-steps 50 \
-  --sampler ddim \
-  --vlm-model Qwen/Qwen2.5-VL-7B-Instruct \
-  --out-dir results/vlm_feedback/scratch_text_s4
-```
-
-- using gemini
-
-```bash
-python scripts/vlm_feedback_clevr.py \
   --vlm gemini \
-  --ckpt /gpfs/scrubbed/sriyash/DiT-clevr-text-final/000-DiT-S-4-text/checkpoints/0100000-ema.pt \
-  --model DiT-S/4 \
-  --vae stabilityai/sdxl-vae \
-  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset \
-  --split val \
-  --num-examples 10 \
-  --cfg-scale 2.0 \
-  --num-sampling-steps 100 \
-  --use-caption \
-  --out-dir results/vlm_feedback/gemini_metadata
+  --use-caption
 ```
 
+Set `OPENROUTER_API_KEY` before running Gemini feedback generation.
+
+## 5. Cache Feedback Qwen Context
+
+```bash
+python preprocess_clevr_context.py \
+  --dataset /gpfs/scrubbed/sriyash/vlm_feedback_dataset_qwen \
+  --mode feedback \
+  --vlm-model Qwen/Qwen3.5-4B \
+  --max-context-len 1024 \
+  --batch-size 4 \
+  --overwrite
+```
+
+## 6. Finetune With Base + Feedback
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=4 train_text.py \
+  --config-name train_adaptive
+```
+
+`configs/train_adaptive.yaml` keeps the dataset schema as:
+
+```yaml
+data:
+  dataset_config:
+    - name: base
+      dataset_path: /path/to/base/data.zarr
+      sampling_ratio: 0.5
+    - name: feedback
+      dataset_path: /path/to/feedback/data.zarr
+      sampling_ratio: 0.5
+```
+
+The sampler applies these ratios globally across the concatenated datasets.
+
+## Dataset Regeneration
+
+Changing the training resize preprocessing does not require regenerating `data.zarr` if `model.image_size` stays fixed. The cached dataset stores context tokens and resized RGB images. Regenerate when rows, splits, VLM model, prompt/context construction, or image size changes.
+
+## 7. Evaluate
+
+Cached validation grid:
+
+```bash
+python scripts/sample_clevr_eval_grid.py \
+  --mode text \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-qwen-clevr-feedback/feedback_s4/checkpoints/0100000-ema.pt \
+  --model DiT-S/4 \
+  --vae stabilityai/sdxl-vae \
+  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset/data.zarr \
+  --split val \
+  --num-captions 5 \
+  --samples-per-caption 4 \
+  --cfg-scale 2.0 \
+  --num-sampling-steps 100 \
+  --out results/eval_samples/qwen_val_grid.png
+```
+
+Iterative feedback loop:
+
+```bash
+python scripts/eval_adaptive_feedback_loop.py \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-qwen-clevr-feedback/feedback_s4/checkpoints/0100000-ema.pt \
+  --model DiT-S/4 \
+  --vae stabilityai/sdxl-vae \
+  --dataset-root /gpfs/scrubbed/sriyash/clevr_dit_dataset/data.zarr \
+  --split val \
+  --num-captions 5 \
+  --steps 8 \
+  --cfg-scale 2.0 \
+  --num-sampling-steps 100 \
+  --vlm-model Qwen/Qwen3.5-4B \
+  --out-dir results/adaptive_feedback_loop_eval
+```
+
+Raw caption sample:
+
+```bash
+python scripts/sample_text.py \
+  --ckpt /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base/base_s4/checkpoints/0100000-ema.pt \
+  --model DiT-S/4 \
+  --caption "objects: small gray metal sphere, large yellow metal sphere, large blue rubber cube." \
+  --cfg-scale 2.0 \
+  --num-samples 4 \
+  --out sample_text.png
+```

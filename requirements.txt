@@ -6,4 +6,10 @@ timm
 diffusers
 accelerate
 transformers
-sentencepiece
+qwen-vl-utils
+requests
+matplotlib
+tqdm
+hydra-core
+zarr<3
+numcodecs

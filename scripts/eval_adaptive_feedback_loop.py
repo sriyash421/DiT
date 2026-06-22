@@ -19,14 +19,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from diffusers.models import AutoencoderKL
 from PIL import Image
-from transformers import AutoTokenizer, T5EncoderModel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from diffusion import create_diffusion  # noqa: E402
+from datasets_clevr import ClevrContextDataset  # noqa: E402
 from models import DiT_models  # noqa: E402
+from vlm_utils import build_context_text, encode_contexts, load_metadata_rows, load_vlm, metadata_for_row  # noqa: E402
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_GEMINI_MODEL_ID = "google/gemini-3.1-flash-lite"
@@ -62,22 +63,6 @@ def image_to_data_url(image):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def masked_mean(hidden, mask):
-    mask = mask.unsqueeze(-1).to(hidden.dtype)
-    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
-
-
-@torch.no_grad()
-def encode_texts(tokenizer, encoder, texts, max_length, device):
-    encoded = tokenizer(texts, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
-    encoded = {key: value.to(device) for key, value in encoded.items()}
-    hidden = encoder(**encoded).last_hidden_state
-    mask = encoded["attention_mask"]
-    hidden = hidden * mask.unsqueeze(-1).to(hidden.dtype)
-    pooled = masked_mean(hidden, mask)
-    return hidden, mask.bool(), pooled
-
-
 def load_checkpoint(path, use_ema=True):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(checkpoint, dict) and ("ema" in checkpoint or "model" in checkpoint):
@@ -85,22 +70,24 @@ def load_checkpoint(path, use_ema=True):
     return checkpoint
 
 
-def select_record(dataset_root, split, template, caption_seed, caption_index):
-    records, index = select_records(dataset_root, split, template, caption_seed, caption_index, 1)
+def select_record(dataset_root, split, caption_seed, caption_index):
+    records, index = select_records(dataset_root, split, caption_seed, caption_index, 1)
     return records[0], index
 
 
-def select_records(dataset_root, split, template, caption_seed, caption_index, num_captions):
-    index_path = Path(dataset_root) / "text_embeddings" / "index.json"
-    with index_path.open() as f:
-        index = json.load(f)
-    records = [r for r in index["records"] if r["split"] == split and r["template"] == template]
-    if not records:
-        raise RuntimeError(f"No records for split={split}, template={template}")
+def select_records(dataset_root, split, caption_seed, caption_index, num_captions):
+    dataset = ClevrContextDataset(dataset_root, transform=None, split=split)
+    if len(dataset) == 0:
+        raise RuntimeError(f"No records for split={split}")
     rng = random.Random(caption_seed)
-    records = rng.sample(records, len(records))
-    selected = [records[(caption_index + i) % len(records)] for i in range(num_captions)]
-    return selected, index
+    indices = rng.sample(range(len(dataset)), len(dataset))
+    selected = []
+    for i in range(num_captions):
+        idx = indices[(caption_index + i) % len(indices)]
+        record = dataset.record_for_index(idx)
+        record["_dataset"] = dataset
+        selected.append(record)
+    return selected, {"context_dim": dataset.context_dim}
 
 
 def feedback_prompt(caption=None):
@@ -156,26 +143,23 @@ def gemini_feedback(args, gt_image, current_image, caption):
 
 
 @torch.no_grad()
-def sample_image(args, model, vae, diffusion, tokenizer, encoder, caption, feedback, attempt_image, device, seed):
+def sample_image(args, model, vae, diffusion, processor, vlm, metadata, caption, feedback, current_image, device, seed):
     latent_size = args.image_size // 8
-    text_tokens, text_mask, text_pooled = encode_texts(tokenizer, encoder, [caption], args.max_text_len, device)
+    context_text = build_context_text(caption, metadata, feedback)
+    images = [current_image] if feedback is not None and current_image is not None else [None]
+    context_tokens, context_mask = encode_contexts(
+        processor,
+        vlm,
+        [context_text],
+        device,
+        images=images,
+        max_length=args.max_context_len,
+        out_dtype=torch.float16,
+    )
     model_kwargs = {
-        "text_tokens": text_tokens,
-        "text_mask": text_mask,
-        "text_pooled": text_pooled,
+        "context_tokens": context_tokens.float().to(device),
+        "context_mask": context_mask.to(device),
     }
-    if feedback is not None and attempt_image is not None:
-        feedback_tokens, feedback_mask, feedback_pooled = encode_texts(tokenizer, encoder, [feedback], args.max_text_len, device)
-        attempt = pil_to_tensor(attempt_image, args.image_size).unsqueeze(0).to(device)
-        attempt_latent = vae.encode(attempt).latent_dist.mode().mul_(vae.config.scaling_factor)
-        model_kwargs.update({
-            "feedback_tokens": feedback_tokens,
-            "feedback_mask": feedback_mask,
-            "feedback_pooled": feedback_pooled,
-            "attempt_latent": attempt_latent,
-        })
-        if args.drop_caption_after_feedback:
-            model_kwargs["drop_caption"] = torch.ones(1, device=device, dtype=torch.bool)
 
     generator = torch.Generator(device=device).manual_seed(seed)
     z = torch.randn(1, 4, latent_size, latent_size, device=device, generator=generator)
@@ -188,7 +172,7 @@ def sample_image(args, model, vae, diffusion, tokenizer, encoder, caption, feedb
             for key, value in model_kwargs.items()
         }
         model_kwargs["cfg_scale"] = args.cfg_scale
-        forward_fn = model.forward_with_text_cfg
+        forward_fn = model.forward_with_cfg
 
     sample_loop = diffusion.ddim_sample_loop if args.sampler == "ddim" else diffusion.p_sample_loop
     samples = sample_loop(
@@ -258,14 +242,13 @@ def maybe_log_to_wandb(args, trace_paths, combined_path):
         config={
             "eval_ckpt": args.ckpt,
             "eval_split": args.split,
-            "eval_template": args.template,
             "eval_caption_index": args.caption_index,
             "eval_num_captions": args.num_captions,
             "eval_feedback_steps": args.steps,
             "eval_cfg_scale": args.cfg_scale,
             "eval_num_sampling_steps": args.num_sampling_steps,
             "eval_sampler": args.sampler,
-            "eval_drop_caption_after_feedback": args.drop_caption_after_feedback,
+            "eval_vlm_model": args.vlm_model,
         },
     )
     trace_images = []
@@ -293,11 +276,10 @@ def maybe_log_to_wandb(args, trace_paths, combined_path):
 
 
 @torch.no_grad()
-def run_trace(args, model, vae, diffusion, tokenizer, encoder, record, out_dir, device):
+def run_trace(args, model, vae, diffusion, processor, vlm, record, metadata, out_dir, device):
     out_dir.mkdir(parents=True, exist_ok=True)
     caption = record["caption"]
-    gt_path = Path(args.dataset_root) / record["image_path"]
-    gt_image = center_crop_arr(Image.open(gt_path).convert("RGB"), args.image_size)
+    gt_image = center_crop_arr(record["_dataset"].image_for_row(record["row_idx"]), args.image_size)
 
     rows = []
     usage_totals = {}
@@ -309,8 +291,9 @@ def run_trace(args, model, vae, diffusion, tokenizer, encoder, record, out_dir, 
             model,
             vae,
             diffusion,
-            tokenizer,
-            encoder,
+            processor,
+            vlm,
+            metadata,
             caption,
             current_feedback,
             current_image,
@@ -366,32 +349,42 @@ def main(args):
     records, index = select_records(
         args.dataset_root,
         args.split,
-        args.template,
         args.caption_seed,
         args.caption_index,
         args.num_captions,
     )
 
+    metadata_rows, metadata_by_image_path = load_metadata_rows(Path(args.dataset_root).parent)
+    context_dim = index["context_dim"]
     model = DiT_models[args.model](
         input_size=args.image_size // 8,
         num_classes=args.num_classes,
         text_conditioning=True,
-        text_embed_dim=index["embedding_dim"],
-        max_text_len=index["max_length"],
+        context_dim=context_dim,
     ).to(device)
     model.load_state_dict(load_checkpoint(args.ckpt, args.ema), strict=True)
     model.eval()
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
     vae.eval()
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    tokenizer = AutoTokenizer.from_pretrained(args.encoder)
-    encoder = T5EncoderModel.from_pretrained(args.encoder).to(device)
-    encoder.eval()
+    processor, vlm = load_vlm(args.vlm_model, device, dtype=args.vlm_dtype, device_map=args.device_map)
 
     trace_paths = []
     usage_totals = {}
     for idx, record in enumerate(records):
-        trace_path, usage = run_trace(args, model, vae, diffusion, tokenizer, encoder, record, out_dir / f"caption_{idx:02d}", device)
+        metadata = metadata_for_row(record, metadata_rows, metadata_by_image_path)
+        trace_path, usage = run_trace(
+            args,
+            model,
+            vae,
+            diffusion,
+            processor,
+            vlm,
+            record,
+            metadata,
+            out_dir / f"caption_{idx:02d}",
+            device,
+        )
         trace_paths.append(trace_path)
         for key, value in usage.items():
             usage_totals[key] = usage_totals.get(key, 0) + value
@@ -412,7 +405,6 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, default="stabilityai/sdxl-vae")
     parser.add_argument("--dataset-root", type=str, default="/gpfs/scrubbed/sriyash/clevr_dit_dataset")
     parser.add_argument("--split", choices=["train", "val"], default="val")
-    parser.add_argument("--template", type=str, default="chain")
     parser.add_argument("--caption-seed", type=int, default=0)
     parser.add_argument("--caption-index", type=int, default=0)
     parser.add_argument("--num-captions", type=int, default=1)
@@ -425,9 +417,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fixed-seed-per-trace", action="store_true", help="Use the same sampling seed at every feedback step to isolate conditioning effects.")
     parser.add_argument("--steps", type=int, default=8, help="Number of feedback/regeneration steps after the initial image.")
-    parser.add_argument("--drop-caption-after-feedback", action="store_true", help="After step 0, null only the caption while keeping feedback and image context.")
-    parser.add_argument("--encoder", type=str, default="google/flan-t5-large")
-    parser.add_argument("--max-text-len", type=int, default=128)
+    parser.add_argument("--vlm-model", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--vlm-dtype", choices=["auto", "float16", "bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--device-map", type=str, default="auto")
+    parser.add_argument("--max-context-len", type=int, default=1024)
     parser.add_argument("--gemini-model", type=str, default=OPENROUTER_GEMINI_MODEL_ID)
     parser.add_argument("--openrouter-api-key-env", type=str, default="OPENROUTER_API_KEY")
     parser.add_argument("--openrouter-retries", type=int, default=2)
@@ -444,4 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-resume", type=str, default="allow")
     parser.add_argument("--wandb-key", type=str, default="eval/feedback_loop_grid")
     parser.add_argument("--wandb-step", type=int, default=None)
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.device_map == "":
+        args.device_map = None
+    main(args)

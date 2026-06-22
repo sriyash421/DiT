@@ -3,7 +3,7 @@
 Generate a CLEVR VLM-feedback dataset from a text-conditioned DiT checkpoint.
 
 Default debug scale:
-  50 images * 1 sampled template/image * 10 samples/caption * 10 feedbacks/sample = 5000 rows
+  50 images * all cached caption records/image * 10 samples/caption * 10 feedbacks/sample
 """
 import argparse
 import base64
@@ -12,7 +12,6 @@ import hashlib
 import io
 import json
 import os
-import random
 import sys
 import time
 from pathlib import Path
@@ -30,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from diffusion import create_diffusion  # noqa: E402
+from datasets_clevr import ClevrContextDataset, pad_contexts  # noqa: E402
 from models import DiT_models  # noqa: E402
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -71,7 +71,7 @@ def load_checkpoint(path, use_ema):
 
 
 def load_metadata_rows(dataset_root):
-    rows = load_jsonl(Path(dataset_root) / "metadata.jsonl")
+    rows = load_jsonl(Path(dataset_root).parent / "metadata.jsonl")
     by_image_path = {row.get("image_path"): row for row in rows}
     return rows, by_image_path
 
@@ -79,9 +79,7 @@ def load_metadata_rows(dataset_root):
 def metadata_for_record(record, metadata_rows, metadata_by_image_path):
     metadata_index = record.get("metadata_index")
     if isinstance(metadata_index, int) and 0 <= metadata_index < len(metadata_rows):
-        row = metadata_rows[metadata_index]
-        if row.get("image_path") == record.get("image_path"):
-            return row
+        return metadata_rows[metadata_index]
     return metadata_by_image_path.get(record.get("image_path"))
 
 
@@ -113,56 +111,43 @@ def compact_metadata_text(metadata):
 
 
 def load_index(dataset_root):
-    with (Path(dataset_root) / "text_embeddings" / "index.json").open() as f:
-        return json.load(f)
+    dataset = ClevrContextDataset(dataset_root, transform=None, split=None)
+    records = []
+    for idx in range(len(dataset)):
+        record = dataset.record_for_index(idx)
+        record["_dataset"] = dataset
+        records.append(record)
+    return {"records": records, "context_dim": dataset.context_dim}
 
 
-def select_caption_records(index, split, templates, captions_per_image, seed, max_images):
+def select_caption_records(index, split, max_images):
     records = [
         record for record in index["records"]
-        if record["split"] == split and record["template"] in templates
+        if record["split"] == split
     ]
-    grouped = {}
-    for record in records:
-        grouped.setdefault(record["metadata_index"], {})[record["template"]] = record
+    if max_images is None:
+        return records
 
-    rng = random.Random(seed)
     selected = []
-    for metadata_index in sorted(grouped):
-        template_records = grouped[metadata_index]
-        available = [template for template in templates if template in template_records]
-        if not available:
-            continue
-        if captions_per_image >= len(available):
-            chosen = available
-        else:
-            chosen = rng.sample(available, captions_per_image)
-        for template in chosen:
-            selected.append(template_records[template])
-        if max_images is not None and len({r["metadata_index"] for r in selected}) >= max_images:
-            break
+    seen_metadata = set()
+    for record in records:
+        metadata_index = record["metadata_index"]
+        if metadata_index not in seen_metadata:
+            if len(seen_metadata) >= max_images:
+                break
+            seen_metadata.add(metadata_index)
+        selected.append(record)
     return selected
 
 
-def load_text_batch(dataset_root, records, device, dtype):
-    root = Path(dataset_root) / "text_embeddings"
-    shard_cache = {}
+def load_context_batch(dataset_root, records, device, dtype):
     tokens = []
-    masks = []
-    pooled = []
     for record in records:
-        shard_name = record["shard"]
-        if shard_name not in shard_cache:
-            shard_cache[shard_name] = torch.load(root / shard_name, map_location="cpu", weights_only=False)
-        shard = shard_cache[shard_name]
-        offset = int(record["offset"])
-        tokens.append(shard["text_tokens"][offset].to(dtype=dtype))
-        masks.append(shard["text_mask"][offset].bool())
-        pooled.append(shard["text_pooled"][offset].to(dtype=dtype))
+        tokens.append(record["_dataset"].context_for_row(record["row_idx"]).to(dtype=dtype))
+    context_tokens, context_mask = pad_contexts(tokens)
     return {
-        "text_tokens": torch.stack(tokens).to(device),
-        "text_mask": torch.stack(masks).to(device),
-        "text_pooled": torch.stack(pooled).to(device),
+        "context_tokens": context_tokens.to(device),
+        "context_mask": context_mask.to(device),
     }
 
 
@@ -257,8 +242,7 @@ class DiTGenerator:
             input_size=self.latent_size,
             num_classes=args.num_classes,
             text_conditioning=True,
-            text_embed_dim=index["embedding_dim"],
-            max_text_len=index["max_length"],
+            context_dim=index["context_dim"],
         ).to(device)
         self.model.load_state_dict(load_checkpoint(args.ckpt, args.ema), strict=True)
         self.model.eval()
@@ -270,24 +254,23 @@ class DiTGenerator:
 
     @torch.no_grad()
     def generate_batch(self, records, seeds):
-        text_batch = load_text_batch(self.args.dataset_root, records, self.device, self.model_dtype)
+        context_batch = load_context_batch(self.args.dataset_root, records, self.device, self.model_dtype)
         latents = []
         for seed in seeds:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
             latents.append(torch.randn(1, 4, self.latent_size, self.latent_size, device=self.device, generator=generator))
         z = torch.cat(latents, dim=0)
         if self.args.cfg_scale <= 1:
-            model_kwargs = text_batch
+            model_kwargs = context_batch
             forward_fn = self.model.forward
         else:
             z = torch.cat([z, z], dim=0)
             model_kwargs = {
-                "text_tokens": text_batch["text_tokens"].repeat(2, 1, 1),
-                "text_mask": text_batch["text_mask"].repeat(2, 1),
-                "text_pooled": text_batch["text_pooled"].repeat(2, 1),
+                "context_tokens": context_batch["context_tokens"].repeat(2, 1, 1),
+                "context_mask": context_batch["context_mask"].repeat(2, 1),
                 "cfg_scale": self.args.cfg_scale,
             }
-            forward_fn = self.model.forward_with_text_cfg
+            forward_fn = self.model.forward_with_cfg
 
         sample_loop = self.diffusion.ddim_sample_loop if self.args.sampler == "ddim" else self.diffusion.p_sample_loop
         samples = sample_loop(
@@ -316,12 +299,19 @@ def make_generation_tasks(args, caption_records):
     for caption_record in caption_records:
         for sample_index in range(args.samples_per_caption):
             seed = args.seed + int(caption_record["metadata_index"]) * 100_000 + sample_index
+            gt_path = Path(args.out_dir) / "ground_truth" / (
+                f"meta_{int(caption_record['metadata_index']):06d}_{caption_record['template']}.png"
+            )
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            if not gt_path.exists():
+                caption_record["_dataset"].image_for_row(caption_record["row_idx"]).save(gt_path)
             tasks.append({
                 "record": caption_record,
                 "metadata_index": int(caption_record["metadata_index"]),
                 "template": caption_record["template"],
                 "caption": caption_record["caption"],
                 "source_image_path": caption_record["image_path"],
+                "gt_image_path": str(gt_path),
                 "sample_index": sample_index,
                 "sample_seed": seed,
             })
@@ -382,7 +372,7 @@ def build_output_row(args, task, feedback, token_usage):
         "caption": task["caption"],
         "metadata": task["metadata"],
         "metadata_used_for_feedback": task["metadata_used_for_feedback"],
-        "gt_image_path": str(Path(args.dataset_root) / task["source_image_path"]),
+        "gt_image_path": task["gt_image_path"],
         "generated_image_path": task["generated_image_path"],
         "source_image_path": task["source_image_path"],
         "sample_index": task["sample_index"],
@@ -452,7 +442,7 @@ def request_chat_completion(url, api_key, model, content, max_tokens, temperatur
 
 
 def remote_feedback_one(args, task, url, api_key, model):
-    gt = resize_square(Image.open(Path(args.dataset_root) / task["source_image_path"]), args.image_size)
+    gt = resize_square(Image.open(task["gt_image_path"]), args.image_size)
     gen = resize_square(Image.open(task["generated_image_path"]), args.image_size)
     content = [
         {"type": "text", "text": build_feedback_prompt(task["metadata_text"])},
@@ -528,7 +518,7 @@ def load_qwen_local(args, device):
 
 
 def build_qwen_messages(args, task):
-    gt = resize_square(Image.open(Path(args.dataset_root) / task["source_image_path"]), args.image_size)
+    gt = resize_square(Image.open(task["gt_image_path"]), args.image_size)
     gen = resize_square(Image.open(task["generated_image_path"]), args.image_size)
     return [
         {
@@ -624,10 +614,7 @@ def parse_args():
     parser.add_argument("--vae", type=str, default="stabilityai/sdxl-vae")
     parser.add_argument("--dataset-root", type=str, default="data/clevr_50_train")
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--templates", nargs="+", default=["chain", "order", "compact"])
-    parser.add_argument("--captions-per-image", type=int, default=1)
     parser.add_argument("--max-images", type=int, default=None)
-    parser.add_argument("--caption-seed", type=int, default=0)
     parser.add_argument("--samples-per-caption", type=int, default=10)
     parser.add_argument("--feedbacks-per-image", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -680,9 +667,6 @@ def main():
     caption_records = select_caption_records(
         index,
         args.split,
-        args.templates,
-        args.captions_per_image,
-        args.caption_seed,
         args.max_images,
     )
     if not caption_records:

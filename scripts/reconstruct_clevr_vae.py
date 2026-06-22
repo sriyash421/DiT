@@ -25,10 +25,10 @@ def center_crop_arr(pil_image, image_size):
 
 
 def load_records(data_path, split):
-    index_path = Path(data_path) / "text_embeddings" / "index.json"
-    with index_path.open() as f:
-        index = json.load(f)
-    return [record for record in index["records"] if split is None or record["split"] == split]
+    metadata_path = Path(data_path) / "metadata.jsonl"
+    with metadata_path.open() as f:
+        records = [json.loads(line) for line in f if line.strip()]
+    return [record for record in records if split is None or record["split"] == split]
 
 
 def main(args):
