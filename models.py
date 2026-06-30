@@ -85,6 +85,20 @@ class CrossAttention(nn.Module):
         return out
 
 
+class ContextAdapter(nn.Module):
+    def __init__(self, context_dim, hidden_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(context_dim, eps=1e-6),
+            nn.Linear(context_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, context):
+        return self.net(context)
+
+
 class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, context_dim=None, **block_kwargs):
         super().__init__()
@@ -163,6 +177,11 @@ class DiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         if self.text_conditioning:
             self.null_context = nn.Parameter(torch.zeros(1, null_context_len, context_dim))
+            self.context_adapter = ContextAdapter(context_dim, hidden_size)
+            self.context_pool_proj = nn.Sequential(
+                nn.LayerNorm(hidden_size, eps=1e-6),
+                nn.Linear(hidden_size, hidden_size),
+            )
 
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -171,7 +190,7 @@ class DiT(nn.Module):
                 hidden_size,
                 num_heads,
                 mlp_ratio=mlp_ratio,
-                context_dim=self.context_dim,
+                context_dim=hidden_size if self.text_conditioning else None,
             )
             for _ in range(depth)
         ])
@@ -251,6 +270,16 @@ class DiT(nn.Module):
             context_tokens = context_tokens + self.null_context.sum().to(dtype=context_tokens.dtype) * 0
         return context_tokens, context_mask
 
+    def adapt_context(self, context_tokens, context_mask):
+        if context_tokens is None:
+            return None, None, None
+        context_tokens = self.context_adapter(context_tokens)
+        mask = context_mask.to(device=context_tokens.device, dtype=context_tokens.dtype)
+        denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled_context = (context_tokens * mask.unsqueeze(-1)).sum(dim=1) / denom
+        pooled_context = self.context_pool_proj(pooled_context)
+        return context_tokens, context_mask, pooled_context
+
     def forward(
         self,
         x,
@@ -264,6 +293,9 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed
         c = self.t_embedder(t)
         context_tokens, context_mask = self.prepare_context(context_tokens, context_mask, drop_context)
+        context_tokens, context_mask, pooled_context = self.adapt_context(context_tokens, context_mask)
+        if pooled_context is not None:
+            c = c + pooled_context
         if context_tokens is None and y is not None:
             c = c + self.y_embedder(y, self.training)
         for block in self.blocks:

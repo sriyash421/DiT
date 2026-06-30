@@ -24,22 +24,22 @@ train:
   results_dir: /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base
   experiment_name: base_s4
   ckpt: null
-  epochs: 1000
+  epochs: 10000
   global_batch_size: 128
   global_seed: 0
   lr: 1e-4
   lr_schedule: cosine
   lr_warmup_steps: 2000
-  min_lr: 1e-5
-  min_lr_ratio: 0.1
+  min_lr: 3e-5
+  min_lr_ratio: 0.3
   grad_clip: 1.0
   ema_decay: 0.999
   log_every: 100
-  ckpt_every: 5000
-  max_train_steps: 200000
+  ckpt_every: 10000
+  max_train_steps: 100000
 
 dataloader:
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
@@ -48,7 +48,7 @@ dataloader:
 eval:
   split: val
   batch_size: 128
-  max_batches_per_dataset: 128
+  max_batches_per_dataset: 32
   dataloader:
     num_workers: 2
     pin_memory: true

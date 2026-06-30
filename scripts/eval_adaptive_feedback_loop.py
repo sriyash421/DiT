@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from diffusion import create_diffusion  # noqa: E402
 from datasets_clevr import ClevrContextDataset  # noqa: E402
 from models import DiT_models  # noqa: E402
-from vlm_utils import build_context_text, encode_contexts, load_metadata_rows, load_vlm, metadata_for_row  # noqa: E402
+from vlm_utils import build_context_text, compact_metadata_text, encode_contexts, load_metadata_rows, load_vlm, metadata_for_row  # noqa: E402
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_GEMINI_MODEL_ID = "google/gemini-3.1-flash-lite"
@@ -76,6 +76,8 @@ def select_record(dataset_root, split, caption_seed, caption_index):
 
 
 def select_records(dataset_root, split, caption_seed, caption_index, num_captions):
+    if not dataset_root:
+        raise ValueError("--dataset-root must be a non-empty path")
     dataset = ClevrContextDataset(dataset_root, transform=None, split=split)
     if len(dataset) == 0:
         raise RuntimeError(f"No records for split={split}")
@@ -90,12 +92,19 @@ def select_records(dataset_root, split, caption_seed, caption_index, num_caption
     return selected, {"context_dim": dataset.context_dim}
 
 
-def feedback_prompt(caption=None):
-    caption_block = f"Caption:\n{caption}\n\n" if caption else ""
+def jsonable_record(record):
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
+def feedback_prompt(metadata=None):
+    metadata_block = ""
+    metadata_text = compact_metadata_text(metadata)
+    if metadata_text:
+        metadata_block = f"Original CLEVR metadata, if useful:\n{metadata_text}\n\n"
     return (
         "You are evaluating a text-conditioned diffusion model trained on CLEVR images. "
         "The first image is the ground-truth image. The second image is the current generated image.\n\n"
-        f"{caption_block}"
+        f"{metadata_block}"
         "Return exactly one short corrective feedback sentence. Do not use bullets. "
         "Do not mention anything already correct. Do not praise the image. "
         "Choose the highest-priority needed edit using this priority order: "
@@ -109,7 +118,7 @@ def feedback_prompt(caption=None):
     )
 
 
-def gemini_feedback(args, gt_image, current_image, caption):
+def gemini_feedback(args, gt_image, current_image, caption, metadata):
     import requests
 
     api_key = os.getenv(args.openrouter_api_key_env)
@@ -117,7 +126,10 @@ def gemini_feedback(args, gt_image, current_image, caption):
         raise ValueError(f"Set {args.openrouter_api_key_env} for OpenRouter access")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     content = [
-        {"type": "text", "text": feedback_prompt(caption if args.feedback_uses_caption else None)},
+        {
+            "type": "text",
+            "text": feedback_prompt(metadata if args.use_caption else None),
+        },
         {"type": "text", "text": "Ground-truth image:"},
         {"type": "image_url", "image_url": {"url": image_to_data_url(gt_image)}},
         {"type": "text", "text": "Current generated image:"},
@@ -280,6 +292,7 @@ def run_trace(args, model, vae, diffusion, processor, vlm, record, metadata, out
     out_dir.mkdir(parents=True, exist_ok=True)
     caption = record["caption"]
     gt_image = center_crop_arr(record["_dataset"].image_for_row(record["row_idx"]), args.image_size)
+    gt_path = record.get("image_path", "")
 
     rows = []
     usage_totals = {}
@@ -305,7 +318,7 @@ def run_trace(args, model, vae, diffusion, processor, vlm, record, metadata, out
         feedback_for_next = ""
         usage = {}
         if step < args.steps:
-            feedback_for_next, usage = gemini_feedback(args, gt_image, image, caption)
+            feedback_for_next, usage = gemini_feedback(args, gt_image, image, caption, metadata)
             for key, value in usage.items():
                 if isinstance(value, (int, float)):
                     usage_totals[key] = usage_totals.get(key, 0) + value
@@ -325,7 +338,7 @@ def run_trace(args, model, vae, diffusion, processor, vlm, record, metadata, out
     trace = {
         "caption": caption,
         "gt_image_path": str(gt_path),
-        "record": record,
+        "record": jsonable_record(record),
         "steps": rows,
         "token_usage_totals": usage_totals,
         "args": vars(args),
@@ -354,7 +367,7 @@ def main(args):
         args.num_captions,
     )
 
-    metadata_rows, metadata_by_image_path = load_metadata_rows(Path(args.dataset_root).parent)
+    metadata_rows, metadata_by_image_path = load_metadata_rows(args.dataset_root)
     context_dim = index["context_dim"]
     model = DiT_models[args.model](
         input_size=args.image_size // 8,
@@ -426,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--openrouter-retries", type=int, default=2)
     parser.add_argument("--feedback-temperature", type=float, default=0.0)
     parser.add_argument("--max-feedback-tokens", type=int, default=96)
-    parser.add_argument("--feedback-uses-caption", action="store_true")
+    parser.add_argument("--use-caption", action="store_true", help="Include compact CLEVR metadata, not rendered caption text, in feedback prompt.")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--out-dir", type=str, default="results/adaptive_feedback_loop_eval")
     parser.add_argument("--dpi", type=int, default=150)

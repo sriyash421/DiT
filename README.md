@@ -173,3 +173,6 @@ python scripts/sample_text.py \
   --num-samples 4 \
   --out sample_text.png
 ```
+
+
+current best ckpt: /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base/base_l4_lr1e-4_minlr1e-5_warmup5k_ema999
