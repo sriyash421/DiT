@@ -176,3 +176,5 @@ python scripts/sample_text.py \
 
 
 current best ckpt: /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base/base_l4_lr1e-4_minlr1e-5_warmup5k_ema999
+
+curent model with mistakes: /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base/base_l4_lr1e-4_minlr1e-5_warmup5k_ema999_final2/checkpoints/0040000-ema.pt 

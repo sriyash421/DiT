@@ -20,6 +20,7 @@ class ClevrContextDataset(Dataset):
         load_meta=True,
         load_images=False,
         load_context=False,
+        max_dataset_size=None,
     ):
         self.root = Path(root)
         self.transform = transform
@@ -28,9 +29,15 @@ class ClevrContextDataset(Dataset):
         self.load_meta = bool(load_meta)
         self.load_images = bool(load_images)
         self.load_context = bool(load_context)
+        self.max_dataset_size = None if max_dataset_size is None else int(max_dataset_size)
+        if self.max_dataset_size is not None and self.max_dataset_size <= 0:
+            raise ValueError("max_dataset_size must be positive or None.")
         self._zarr = None
         self._data = None
         self._meta = None
+        self._context_cache = None
+        self._image_cache = None
+        self._generated_image_cache = None
         self._open()
 
         self.dataset_type = self._zarr.attrs["dataset_type"]
@@ -40,13 +47,19 @@ class ClevrContextDataset(Dataset):
         self.template_names = list(self._zarr.attrs.get("template_names", []))
 
         split_ids = np.asarray(self._meta["split_id"])
-        if split is None:
-            self.indices = np.arange(split_ids.shape[0], dtype=np.int64)
+        self.indices = self._select_indices(split_ids)
+
+    def _select_indices(self, split_ids):
+        if self.split is None:
+            indices = np.arange(split_ids.shape[0], dtype=np.int64)
         else:
-            if split not in self.split_names:
-                self.indices = np.zeros((0,), dtype=np.int64)
+            if self.split not in self.split_names:
+                indices = np.zeros((0,), dtype=np.int64)
             else:
-                self.indices = np.flatnonzero(split_ids == self.split_names.index(split)).astype(np.int64)
+                indices = np.flatnonzero(split_ids == self.split_names.index(self.split)).astype(np.int64)
+        if self.max_dataset_size is not None:
+            indices = indices[:self.max_dataset_size]
+        return indices
 
     def _open(self):
         root = zarr.open(str(self.root), mode="r")
@@ -54,24 +67,65 @@ class ClevrContextDataset(Dataset):
         meta = root["meta"]
 
         self._zarr = root
+        split_names = list(root.attrs.get("split_names", []))
+        split_ids = np.asarray(meta["split_id"][:])
+        row_indices = self._select_indices_from(split_ids, split_names)
         self._data = {
             "context_offsets": data["context_offsets"][:],
             "image_index": data["image_index"][:],
             "generated_image_index": data["generated_image_index"][:],
-            "context_tokens": data["context_tokens"] if self.use_disk and not self.load_context else data["context_tokens"][:],
-            "images": data["images"] if self.use_disk and not self.load_images else data["images"][:],
-            "generated_images": data["generated_images"] if self.use_disk and not self.load_images else data["generated_images"][:],
+            "context_tokens": data["context_tokens"] if (self.use_disk and not self.load_context) or self.max_dataset_size is not None else data["context_tokens"][:],
+            "images": data["images"] if (self.use_disk and not self.load_images) or self.max_dataset_size is not None else data["images"][:],
+            "generated_images": data["generated_images"] if (self.use_disk and not self.load_images) or self.max_dataset_size is not None else data["generated_images"][:],
         }
         if self.load_meta:
             self._meta = {key: value[:] for key, value in meta.items()}
         else:
             self._meta = {key: value for key, value in meta.items()}
+        self._build_limited_caches(data, row_indices)
+
+    def _select_indices_from(self, split_ids, split_names):
+        if self.split is None:
+            indices = np.arange(split_ids.shape[0], dtype=np.int64)
+        elif self.split not in split_names:
+            indices = np.zeros((0,), dtype=np.int64)
+        else:
+            indices = np.flatnonzero(split_ids == split_names.index(self.split)).astype(np.int64)
+        if self.max_dataset_size is not None:
+            indices = indices[:self.max_dataset_size]
+        return indices
+
+    def _build_limited_caches(self, data, row_indices):
+        if self.max_dataset_size is None:
+            return
+        if self.load_context:
+            offsets = self._data["context_offsets"]
+            self._context_cache = {}
+            for row_idx in row_indices:
+                start = int(offsets[row_idx])
+                end = int(offsets[row_idx + 1])
+                self._context_cache[int(row_idx)] = np.asarray(data["context_tokens"][start:end])
+            self._data["context_tokens"] = data["context_tokens"]
+        if self.load_images:
+            image_ids = np.asarray(self._data["image_index"][row_indices], dtype=np.int64)
+            self._image_cache = {int(image_id): np.asarray(data["images"][int(image_id)]) for image_id in np.unique(image_ids)}
+            generated_ids = np.asarray(self._data["generated_image_index"][row_indices], dtype=np.int64)
+            generated_ids = generated_ids[generated_ids >= 0]
+            self._generated_image_cache = {
+                int(image_id): np.asarray(data["generated_images"][int(image_id)])
+                for image_id in np.unique(generated_ids)
+            }
+            self._data["images"] = data["images"]
+            self._data["generated_images"] = data["generated_images"]
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_zarr"] = None
         state["_data"] = None
         state["_meta"] = None
+        state["_context_cache"] = None
+        state["_image_cache"] = None
+        state["_generated_image_cache"] = None
         return state
 
     def __setstate__(self, state):
@@ -93,12 +147,16 @@ class ClevrContextDataset(Dataset):
         return value
 
     def context_for_row(self, row_idx, dtype=np.float32):
+        if self._context_cache is not None and int(row_idx) in self._context_cache:
+            return torch.from_numpy(np.asarray(self._context_cache[int(row_idx)], dtype=dtype))
         start = int(self._data["context_offsets"][row_idx])
         end = int(self._data["context_offsets"][row_idx + 1])
         return torch.from_numpy(np.asarray(self._data["context_tokens"][start:end], dtype=dtype))
 
     def image_for_row(self, row_idx):
         image_idx = int(self._data["image_index"][row_idx])
+        if self._image_cache is not None and image_idx in self._image_cache:
+            return Image.fromarray(np.asarray(self._image_cache[image_idx]), mode="RGB")
         return Image.fromarray(np.asarray(self._data["images"][image_idx]), mode="RGB")
 
     def record_for_index(self, idx):
@@ -136,6 +194,11 @@ class ClevrContextDataset(Dataset):
             "context_tokens": context_tokens,
             "caption": record["caption"],
             "feedback": record["feedback"],
+            "metadata_index": record["metadata_index"],
+            "template": record["template"],
+            "sample_index": record["sample_index"],
+            "feedback_index": record["feedback_index"],
+            "tuple_id": record["tuple_id"],
             "image_path": record["image_path"],
             "generated_image_path": "" if generated_idx < 0 else f"generated_images/{generated_idx}",
             "dataset_type": dataset_type,
@@ -153,6 +216,7 @@ class ClevrContextMultiDataset(Dataset):
         load_meta=True,
         load_images=False,
         load_context=False,
+        max_dataset_size=None,
     ):
         if not dataset_config:
             raise ValueError("dataset_config must contain at least one dataset.")
@@ -172,6 +236,7 @@ class ClevrContextMultiDataset(Dataset):
                 load_meta=load_meta,
                 load_images=load_images,
                 load_context=load_context,
+                max_dataset_size=entry.get("max_dataset_size", max_dataset_size),
             )
             if len(dataset) == 0:
                 raise ValueError(f"dataset_config[{idx}] has no rows for split={split}: {path}")
@@ -278,6 +343,11 @@ def context_collate(batch):
         "source_name": [item.get("source_name", f"dataset_{item.get('source_index', 0)}") for item in batch],
         "caption": [item["caption"] for item in batch],
         "feedback": [item["feedback"] for item in batch],
+        "metadata_index": torch.tensor([item.get("metadata_index", -1) for item in batch], dtype=torch.long),
+        "template": [item.get("template", "") for item in batch],
+        "sample_index": torch.tensor([item.get("sample_index", -1) for item in batch], dtype=torch.long),
+        "feedback_index": torch.tensor([item.get("feedback_index", -1) for item in batch], dtype=torch.long),
+        "tuple_id": [item.get("tuple_id", "") for item in batch],
         "image_path": [item["image_path"] for item in batch],
         "generated_image_path": [item["generated_image_path"] for item in batch],
     }

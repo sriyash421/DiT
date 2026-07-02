@@ -211,7 +211,7 @@ def add_caption_rows_with_ground_truth(image_path, captions, gt_images, dataset_
     out.save(image_path)
 
 
-def maybe_log_to_wandb(args, image_path):
+def log_to_wandb_if_configured(args, image_path):
     if args.wandb_project is None:
         return
     import wandb
@@ -337,7 +337,7 @@ def main(args):
         elif args.draw_captions:
             add_caption_rows(out, context_batch["captions"], args.samples_per_caption)
         print(f"Saved captions to {captions_path}")
-    maybe_log_to_wandb(args, out)
+    log_to_wandb_if_configured(args, out)
     print(f"Saved samples to {out}")
 
 

@@ -13,3 +13,4 @@ tqdm
 hydra-core
 zarr<3
 numcodecs
+pytest

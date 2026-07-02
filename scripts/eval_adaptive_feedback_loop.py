@@ -241,7 +241,7 @@ def stitch_trace_grids(trace_paths, out_path):
     out.save(out_path)
 
 
-def maybe_log_to_wandb(args, trace_paths, combined_path):
+def log_to_wandb_if_configured(args, trace_paths, combined_path):
     if args.wandb_project is None:
         return
     import wandb
@@ -406,7 +406,7 @@ def main(args):
     stitch_trace_grids(trace_paths, final_grid_path)
     with (out_dir / "usage_totals.json").open("w") as f:
         json.dump(usage_totals, f, indent=2)
-    maybe_log_to_wandb(args, trace_paths, final_grid_path)
+    log_to_wandb_if_configured(args, trace_paths, final_grid_path)
     print(f"Saved feedback-loop grid to {final_grid_path}")
     print(f"Combined token usage totals: {usage_totals}")
 
