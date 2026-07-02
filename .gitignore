@@ -42,6 +42,7 @@ venv.bak/
 .ruff_cache/
 .tox/
 .nox/
+.uv-cache/
 .coverage
 .coverage.*
 coverage.xml
