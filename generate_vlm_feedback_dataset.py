@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ import numpy as np
 import torch
 from diffusers.models import AutoencoderKL
 from PIL import Image
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -158,6 +160,26 @@ def tensor_to_pil(x):
     return Image.fromarray(x)
 
 
+def save_image_tensor(img_tensor, out_path):
+    tensor_to_pil(img_tensor).save(out_path)
+
+
+def drain_save_futures(save_futures, wait_for_one=False):
+    if not save_futures:
+        return
+    if wait_for_one:
+        done, pending = concurrent.futures.wait(
+            save_futures,
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+    else:
+        done, pending = concurrent.futures.wait(save_futures)
+    for future in done:
+        future.result()
+    save_futures.clear()
+    save_futures.update(pending)
+
+
 def resize_square(image, size):
     image = image.convert("RGB")
     w, h = image.size
@@ -192,7 +214,7 @@ def save_tensor_grid(images, path, nrow):
     canvas.save(path)
 
 
-def build_feedback_prompt(metadata_text=None):
+def build_feedback_prompt(caption=None, enable_thinking=False):
     # Previous prompt version kept for reference:
     # prompt = (
     #     "You are evaluating a text-conditioned diffusion model trained on CLEVR images. "
@@ -202,24 +224,21 @@ def build_feedback_prompt(metadata_text=None):
     #     "Do not praise the image and do not restate the caption. "
     #     "List only the changes needed to make the generated image match the caption and ground truth."
     # )
-    metadata_block = ""
-    if metadata_text:
-        metadata_block = f"Original CLEVR metadata, if useful:\n{metadata_text}\n\n"
-    return (
-        "You are evaluating a text-conditioned diffusion model trained on CLEVR images. "
-        "The first image is the ground-truth image. The second image is the generated image.\n\n"
-        f"{metadata_block}"
-        "Return exactly one short corrective feedback sentence. Do not use bullets. "
-        "Do not mention anything already correct. Do not praise the image. Do not restate any prompt. "
-        "Choose the highest-priority needed edit using this priority order: "
-        "1) add missing objects or remove extra objects, "
-        "2) fix object shape, "
-        "3) fix object color, "
-        "4) fix object position or depth ordering, "
-        "5) fix material/texture, "
-        "6) fix background or camera style. "
-        "Use an imperative edit, for example: 'Add the missing small red metal cube on the left.'"
+    caption_block = ""
+    if caption:
+        caption_block = f"Caption: {caption}\n\n"
+    prompt = (
+        "Give feedback for a CLEVR image generator. "
+        "Image 1 is correct; image 2 is generated.\n"
+        f"{caption_block}"
+        "Write one short command to fix image 2. "
+        "Use this priority: missing/extra object > shape > color > size > material > position/depth > background. "
+        "Mention one object and one edit only. Do not use and. Do not explain. "
+        "Return only the command, under 12 words."
     )
+    if enable_thinking:
+        prompt += " If you reason, end with exactly: FINAL: <command under 12 words>."
+    return prompt
 
 
 def tuple_key(task):
@@ -296,15 +315,16 @@ def generated_image_path(out_dir, task):
 
 def make_generation_tasks(args, caption_records):
     tasks = []
-    for caption_record in caption_records:
+    gt_root = Path(args.out_dir) / "ground_truth"
+    gt_root.mkdir(parents=True, exist_ok=True)
+    for caption_record in tqdm(caption_records, desc="make generation tasks", unit="caption"):
+        gt_path = gt_root / (
+            f"meta_{int(caption_record['metadata_index']):06d}_{caption_record['template']}.png"
+        )
+        if not gt_path.exists():
+            caption_record["_dataset"].image_for_row(caption_record["row_idx"]).save(gt_path)
         for sample_index in range(args.samples_per_caption):
             seed = args.seed + int(caption_record["metadata_index"]) * 100_000 + sample_index
-            gt_path = Path(args.out_dir) / "ground_truth" / (
-                f"meta_{int(caption_record['metadata_index']):06d}_{caption_record['template']}.png"
-            )
-            gt_path.parent.mkdir(parents=True, exist_ok=True)
-            if not gt_path.exists():
-                caption_record["_dataset"].image_for_row(caption_record["row_idx"]).save(gt_path)
             tasks.append({
                 "record": caption_record,
                 "metadata_index": int(caption_record["metadata_index"]),
@@ -319,6 +339,8 @@ def make_generation_tasks(args, caption_records):
 
 
 def generate_missing_images(args, index, generation_tasks, device):
+    generated_root = Path(args.out_dir) / "generated"
+    generated_root.mkdir(parents=True, exist_ok=True)
     pending = []
     for task in generation_tasks:
         out_path = generated_image_path(args.out_dir, task)
@@ -330,31 +352,37 @@ def generate_missing_images(args, index, generation_tasks, device):
         return
 
     generator = DiTGenerator(args, index, device)
-    for start in range(0, len(pending), args.generation_batch_size):
-        batch = pending[start:start + args.generation_batch_size]
-        records = [task["record"] for task in batch]
-        seeds = [task["sample_seed"] for task in batch]
-        decoded = generator.generate_batch(records, seeds)
-        for img_tensor, task in zip(decoded, batch):
-            out_path = Path(task["generated_image_path"])
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            tensor_to_pil(img_tensor).save(out_path)
-        done = min(start + len(batch), len(pending))
-        print(f"Generated {done}/{len(pending)} missing images")
+    save_futures = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.image_save_workers) as executor:
+        for start in tqdm(range(0, len(pending), args.generation_batch_size), desc="generate images", unit="batch"):
+            batch = pending[start:start + args.generation_batch_size]
+            records = [task["record"] for task in batch]
+            seeds = [task["sample_seed"] for task in batch]
+            decoded = generator.generate_batch(records, seeds)
+            decoded_cpu = decoded.detach().cpu()
+            del decoded
+            for img_tensor, task in zip(decoded_cpu, batch):
+                out_path = Path(task["generated_image_path"])
+                save_futures.add(executor.submit(save_image_tensor, img_tensor, out_path))
+                while len(save_futures) >= args.image_save_queue_size:
+                    drain_save_futures(save_futures, wait_for_one=True)
+        drain_save_futures(save_futures)
 
 
 def make_feedback_tasks(args, generation_tasks, metadata_rows, metadata_by_image_path):
     tasks = []
     for gen_task in generation_tasks:
         metadata = metadata_for_record(gen_task["record"], metadata_rows, metadata_by_image_path)
-        metadata_text = compact_metadata_text(metadata) if args.use_caption else None
+        caption_text = gen_task["caption"] if args.use_caption else None
         for feedback_index in range(args.feedbacks_per_image):
             task = {
                 **{k: v for k, v in gen_task.items() if k != "record"},
                 "feedback_index": feedback_index,
                 "metadata": metadata,
-                "metadata_text": metadata_text,
-                "metadata_used_for_feedback": bool(args.use_caption),
+                "caption_text": caption_text,
+                "metadata_text": None,
+                "caption_used_for_feedback": bool(args.use_caption),
+                "metadata_used_for_feedback": False,
             }
             tasks.append(task)
     return tasks
@@ -371,6 +399,7 @@ def build_output_row(args, task, feedback, token_usage):
         "template": task["template"],
         "caption": task["caption"],
         "metadata": task["metadata"],
+        "caption_used_for_feedback": task.get("caption_used_for_feedback", False),
         "metadata_used_for_feedback": task["metadata_used_for_feedback"],
         "gt_image_path": task["gt_image_path"],
         "generated_image_path": task["generated_image_path"],
@@ -418,7 +447,27 @@ def normalize_chat_url(url):
     return f"{url}/v1/chat/completions"
 
 
-def request_chat_completion(url, api_key, model, content, max_tokens, temperature, retries):
+def clean_feedback_text(text):
+    text = text.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+    marker_match = re.search(r"(?:final|answer)\s*:\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
+    if marker_match:
+        text = marker_match.group(1).strip()
+    answer_match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL)
+    if answer_match:
+        text = answer_match.group(1).strip()
+    text = text.replace("\r", "\n").strip()
+    for line in text.splitlines():
+        line = line.strip(" \t-*#`>\"'")
+        if line:
+            text = line
+            break
+    text = re.sub(r"\s+", " ", text).strip(" \"'")
+    return text
+
+
+def request_chat_completion(url, api_key, model, content, max_tokens, temperature, retries, extra_payload=None):
     import requests
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -428,12 +477,15 @@ def request_chat_completion(url, api_key, model, content, max_tokens, temperatur
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if extra_payload:
+        payload.update(extra_payload)
     for attempt in range(retries + 1):
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=120)
             response.raise_for_status()
             result = response.json()
-            return result["choices"][0]["message"]["content"].strip(), result.get("usage", {}) or {}
+            feedback = clean_feedback_text(result["choices"][0]["message"]["content"])
+            return feedback, result.get("usage", {}) or {}
         except (requests.RequestException, KeyError, IndexError) as exc:
             if attempt >= retries:
                 raise
@@ -445,13 +497,25 @@ def remote_feedback_one(args, task, url, api_key, model):
     gt = resize_square(Image.open(task["gt_image_path"]), args.image_size)
     gen = resize_square(Image.open(task["generated_image_path"]), args.image_size)
     content = [
-        {"type": "text", "text": build_feedback_prompt(task["metadata_text"])},
+        {"type": "text", "text": build_feedback_prompt(task.get("caption_text"), args.enable_thinking)},
         {"type": "text", "text": "Ground-truth image:"},
         {"type": "image_url", "image_url": {"url": image_to_data_url(gt)}},
         {"type": "text", "text": "Generated image:"},
         {"type": "image_url", "image_url": {"url": image_to_data_url(gen)}},
     ]
-    return request_chat_completion(url, api_key, model, content, args.max_new_tokens, args.vlm_temperature, args.openrouter_retries)
+    extra_payload = None
+    if args.vlm == "qwen-vllm":
+        extra_payload = {"chat_template_kwargs": {"enable_thinking": bool(args.enable_thinking)}}
+    return request_chat_completion(
+        url,
+        api_key,
+        model,
+        content,
+        args.max_new_tokens,
+        args.vlm_temperature,
+        args.openrouter_retries,
+        extra_payload=extra_payload,
+    )
 
 
 def run_remote_feedback(args, tasks, jsonl_path, failures_path):
@@ -473,7 +537,7 @@ def run_remote_feedback(args, tasks, jsonl_path, failures_path):
             executor.submit(remote_feedback_one, args, task, url, api_key, model): task
             for task in tasks
         }
-        for future in concurrent.futures.as_completed(future_to_task):
+        for future in tqdm(concurrent.futures.as_completed(future_to_task), total=len(future_to_task), desc="vlm feedback", unit="row"):
             task = future_to_task[future]
             try:
                 feedback, usage = future.result()
@@ -484,8 +548,6 @@ def run_remote_feedback(args, tasks, jsonl_path, failures_path):
             except Exception as exc:
                 append_jsonl(failures_path, {**task, "error": repr(exc), "vlm": args.vlm})
             completed += 1
-            if completed % args.log_every == 0 or completed == len(tasks):
-                print(f"Feedback {completed}/{len(tasks)} complete; usage_totals={usage_totals}")
     return usage_totals
 
 
@@ -568,7 +630,7 @@ def qwen_local_feedback_batch(args, processor, model, tasks):
 def run_qwen_local_feedback(args, tasks, jsonl_path, failures_path, device):
     processor, model = load_qwen_local(args, device)
     completed = 0
-    for start in range(0, len(tasks), args.vlm_batch_size):
+    for start in tqdm(range(0, len(tasks), args.vlm_batch_size), desc="qwen local feedback", unit="batch"):
         batch = tasks[start:start + args.vlm_batch_size]
         try:
             feedbacks = qwen_local_feedback_batch(args, processor, model, batch)
@@ -578,12 +640,10 @@ def run_qwen_local_feedback(args, tasks, jsonl_path, failures_path, device):
             for task in batch:
                 append_jsonl(failures_path, {**task, "error": repr(exc), "vlm": args.vlm})
         completed += len(batch)
-        if completed % args.log_every == 0 or completed == len(tasks):
-            print(f"Feedback {completed}/{len(tasks)} complete")
     return {}
 
 
-def preview_grid(args, rows, out_path, max_rows=8):
+def preview_grid(args, rows, out_path, max_rows=20):
     if not rows:
         return
     rows = rows[:max_rows]
@@ -626,10 +686,13 @@ def parse_args():
     parser.add_argument("--ddim-eta", type=float, default=0.0)
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generation-batch-size", type=int, default=16)
+    parser.add_argument("--image-save-workers", type=int, default=8)
+    parser.add_argument("--image-save-queue-size", type=int, default=1024)
     parser.add_argument("--vlm", choices=["gemini", "qwen-local", "qwen-vllm"], default="gemini")
     parser.add_argument("--vlm-temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--use-caption", action="store_true", help="Include compact CLEVR metadata, not rendered caption text, in VLM prompt.")
+    parser.add_argument("--use-caption", action="store_true", help="Include the rendered caption in the VLM prompt.")
+    parser.add_argument("--enable-thinking", action="store_true", help="Enable Qwen thinking in vLLM and extract the final correction.")
     parser.add_argument("--vlm-workers", type=int, default=8)
     parser.add_argument("--vlm-batch-size", type=int, default=8)
     parser.add_argument("--gemini-model", type=str, default=OPENROUTER_GEMINI_MODEL_ID)
@@ -647,6 +710,10 @@ def parse_args():
     parser.add_argument("--preview-dpi", type=int, default=150)
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
+    if args.image_save_workers <= 0:
+        raise ValueError("--image-save-workers must be positive")
+    if args.image_save_queue_size <= 0:
+        raise ValueError("--image-save-queue-size must be positive")
     if args.qwen_device_map == "":
         args.qwen_device_map = None
     return args

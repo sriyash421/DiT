@@ -21,19 +21,8 @@ from models import DiT_models
 from scripts.sample_clevr_eval_grid import load_checkpoint_and_config, config_get
 
 
-DATASET_ROOT = "/gpfs/scrubbed/sriyash/clevr_dit_dataset/data.zarr"
+DATASET_ROOT = "/gscratch/scrubbed/sriyash/clevr_dit_dataset/data.zarr"
 DEFAULT_OUT_DIR = "results/eval_samples/gt_pred_100"
-
-
-def load_font(size):
-    for font_path in (
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ):
-        if Path(font_path).exists():
-            return ImageFont.truetype(font_path, size=size)
-    return ImageFont.load_default()
-
 
 def resolve_model_args(config):
     return {
@@ -119,14 +108,13 @@ def save_gt_pred_grid(path, gt_images, pred_images, rows, cols, gap):
     out_h = rows * cell_h + max(rows - 1, 0) * gap
     out = Image.new("RGB", (out_w, out_h), (255, 255, 255))
     draw = ImageDraw.Draw(out)
-    font = load_font(14)
     for idx, (gt, pred) in enumerate(zip(gt_images, pred_images)):
         row = idx // cols
         col = idx % cols
         x = col * (pair_w + gap)
         y = row * (cell_h + gap)
-        draw.text((x + 8, y + 4), "GT", fill=(20, 20, 20), font=font)
-        draw.text((x + tile + 8, y + 4), "Pred", fill=(20, 20, 20), font=font)
+        draw.text((x + 8, y + 4), "GT", fill=(20, 20, 20))
+        draw.text((x + tile + 8, y + 4), "Pred", fill=(20, 20, 20))
         out.paste(gt.resize((tile, tile), Image.Resampling.LANCZOS), (x, y + label_h))
         out.paste(pred.resize((tile, tile), Image.Resampling.LANCZOS), (x + tile, y + label_h))
         draw.rectangle((x, y + label_h, x + tile - 1, y + label_h + tile - 1), outline=(0, 0, 0))
