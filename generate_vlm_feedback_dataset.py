@@ -6,13 +6,10 @@ Default debug scale:
   50 images * all cached caption records/image * 10 samples/caption * 10 feedbacks/sample
 """
 import argparse
-import base64
 import concurrent.futures
 import hashlib
-import io
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -32,10 +29,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from diffusion import create_diffusion  # noqa: E402
 from datasets_clevr import ClevrContextDataset, pad_contexts  # noqa: E402
+from feedback_verifiers import (  # noqa: E402
+    DEFAULT_GEMINI_MODEL,
+    OPENROUTER_API_URL,
+    build_feedback_verifier,
+    resize_square,
+)
 from models import DiT_models  # noqa: E402
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_GEMINI_MODEL_ID = "google/gemini-3.1-flash-lite"
+OPENROUTER_GEMINI_MODEL_ID = DEFAULT_GEMINI_MODEL
 
 
 def load_jsonl(path):
@@ -83,33 +85,6 @@ def metadata_for_record(record, metadata_rows, metadata_by_image_path):
     if isinstance(metadata_index, int) and 0 <= metadata_index < len(metadata_rows):
         return metadata_rows[metadata_index]
     return metadata_by_image_path.get(record.get("image_path"))
-
-
-def compact_metadata_text(metadata):
-    if metadata is None:
-        return None
-    objects = metadata.get("objects", [])
-    object_lines = []
-    for obj in objects:
-        object_lines.append(
-            f"id {obj.get('id')}: {obj.get('size')} {obj.get('color')} "
-            f"{obj.get('material')} {obj.get('shape')} ({obj.get('label')})"
-        )
-    orders = metadata.get("orders", {})
-
-    def order_text(key):
-        labels = []
-        for idx in orders.get(key, []):
-            match = next((obj for obj in objects if obj.get("id") == idx), None)
-            labels.append(match.get("label", str(idx)) if match else str(idx))
-        return ", ".join(labels)
-
-    return "\n".join([
-        "Objects:",
-        *object_lines,
-        f"Left-to-right order: {order_text('left_to_right')}",
-        f"Front-to-back order: {order_text('front_to_back')}",
-    ])
 
 
 def load_index(dataset_root):
@@ -180,22 +155,6 @@ def drain_save_futures(save_futures, wait_for_one=False):
     save_futures.update(pending)
 
 
-def resize_square(image, size):
-    image = image.convert("RGB")
-    w, h = image.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    return image.crop((left, top, left + side, top + side)).resize((size, size), Image.Resampling.LANCZOS)
-
-
-def image_to_data_url(image):
-    image_bytes = io.BytesIO()
-    image.convert("RGB").save(image_bytes, format="PNG")
-    encoded = base64.b64encode(image_bytes.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
 def save_tensor_grid(images, path, nrow):
     images = images.detach().float().cpu().clamp(-1, 1)
     images = (images + 1) / 2
@@ -212,33 +171,6 @@ def save_tensor_grid(images, path, nrow):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
-
-
-def build_feedback_prompt(caption=None, enable_thinking=False):
-    # Previous prompt version kept for reference:
-    # prompt = (
-    #     "You are evaluating a text-conditioned diffusion model trained on CLEVR images. "
-    #     "The first image is the ground-truth image. The second image is the generated image.\n\n"
-    #     f"Caption: {caption}\n\n"
-    #     "Write only very short corrective feedback. Do not mention anything that is already correct. "
-    #     "Do not praise the image and do not restate the caption. "
-    #     "List only the changes needed to make the generated image match the caption and ground truth."
-    # )
-    caption_block = ""
-    if caption:
-        caption_block = f"Caption: {caption}\n\n"
-    prompt = (
-        "Give feedback for a CLEVR image generator. "
-        "Image 1 is correct; image 2 is generated.\n"
-        f"{caption_block}"
-        "Write one short command to fix image 2. "
-        "Use this priority: missing/extra object > shape > color > size > material > position/depth > background. "
-        "Mention one object and one edit only. Do not use and. Do not explain. "
-        "Return only the command, under 12 words."
-    )
-    if enable_thinking:
-        prompt += " If you reason, end with exactly: FINAL: <command under 12 words>."
-    return prompt
 
 
 def tuple_key(task):
@@ -438,209 +370,87 @@ def openrouter_api_key(args):
     return key
 
 
-def normalize_chat_url(url):
-    url = url.rstrip("/")
-    if url.endswith("/chat/completions"):
-        return url
-    if url.endswith("/v1"):
-        return f"{url}/chat/completions"
-    return f"{url}/v1/chat/completions"
-
-
-def clean_feedback_text(text):
-    text = text.strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
-    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
-    marker_match = re.search(r"(?:final|answer)\s*:\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
-    if marker_match:
-        text = marker_match.group(1).strip()
-    answer_match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL)
-    if answer_match:
-        text = answer_match.group(1).strip()
-    text = text.replace("\r", "\n").strip()
-    for line in text.splitlines():
-        line = line.strip(" \t-*#`>\"'")
-        if line:
-            text = line
-            break
-    text = re.sub(r"\s+", " ", text).strip(" \"'")
-    return text
-
-
-def request_chat_completion(url, api_key, model, content, max_tokens, temperature, retries, extra_payload=None):
-    import requests
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if extra_payload:
-        payload.update(extra_payload)
-    for attempt in range(retries + 1):
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
-            response.raise_for_status()
-            result = response.json()
-            feedback = clean_feedback_text(result["choices"][0]["message"]["content"])
-            return feedback, result.get("usage", {}) or {}
-        except (requests.RequestException, KeyError, IndexError) as exc:
-            if attempt >= retries:
-                raise
-            time.sleep(2 ** attempt)
-    raise RuntimeError("unreachable")
-
-
-def remote_feedback_one(args, task, url, api_key, model):
-    gt = resize_square(Image.open(task["gt_image_path"]), args.image_size)
-    gen = resize_square(Image.open(task["generated_image_path"]), args.image_size)
-    content = [
-        {"type": "text", "text": build_feedback_prompt(task.get("caption_text"), args.enable_thinking)},
-        {"type": "text", "text": "Ground-truth image:"},
-        {"type": "image_url", "image_url": {"url": image_to_data_url(gt)}},
-        {"type": "text", "text": "Generated image:"},
-        {"type": "image_url", "image_url": {"url": image_to_data_url(gen)}},
-    ]
-    extra_payload = None
-    if args.vlm == "qwen-vllm":
-        extra_payload = {"chat_template_kwargs": {"enable_thinking": bool(args.enable_thinking)}}
-    return request_chat_completion(
-        url,
-        api_key,
-        model,
-        content,
-        args.max_new_tokens,
-        args.vlm_temperature,
-        args.openrouter_retries,
-        extra_payload=extra_payload,
-    )
-
-
-def run_remote_feedback(args, tasks, jsonl_path, failures_path):
+def build_dataset_feedback_verifier(args, device):
     if args.vlm == "gemini":
-        url = OPENROUTER_API_URL
-        api_key = openrouter_api_key(args)
-        model = args.gemini_model
-        workers = args.vlm_workers
-    else:
-        url = normalize_chat_url(args.vllm_base_url)
-        api_key = args.vllm_api_key
-        model = args.vllm_model
-        workers = args.vlm_batch_size
-
-    completed = 0
-    usage_totals = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_task = {
-            executor.submit(remote_feedback_one, args, task, url, api_key, model): task
-            for task in tasks
-        }
-        for future in tqdm(concurrent.futures.as_completed(future_to_task), total=len(future_to_task), desc="vlm feedback", unit="row"):
-            task = future_to_task[future]
-            try:
-                feedback, usage = future.result()
-                append_jsonl(jsonl_path, build_output_row(args, task, feedback, usage))
-                for key, value in usage.items():
-                    if isinstance(value, (int, float)):
-                        usage_totals[key] = usage_totals.get(key, 0) + value
-            except Exception as exc:
-                append_jsonl(failures_path, {**task, "error": repr(exc), "vlm": args.vlm})
-            completed += 1
-    return usage_totals
-
-
-def load_qwen_local(args, device):
-    from transformers import AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(args.qwen_model, trust_remote_code=True)
-    errors = []
-    for class_name in (
-        "AutoModelForImageTextToText",
-        "AutoModelForVision2Seq",
-        "Qwen2_5_VLForConditionalGeneration",
-        "Qwen2VLForConditionalGeneration",
-    ):
-        try:
-            module = __import__("transformers", fromlist=[class_name])
-            model_cls = getattr(module, class_name)
-            kwargs = {"trust_remote_code": True}
-            kwargs["torch_dtype"] = "auto" if args.qwen_dtype == "auto" else getattr(torch, args.qwen_dtype)
-            if args.qwen_device_map:
-                kwargs["device_map"] = args.qwen_device_map
-            model = model_cls.from_pretrained(args.qwen_model, **kwargs)
-            if not args.qwen_device_map:
-                model = model.to(device)
-            model.eval()
-            return processor, model
-        except Exception as exc:
-            errors.append(f"{class_name}: {exc}")
-    raise RuntimeError("Could not load local Qwen model. Tried:\n" + "\n".join(errors))
-
-
-def build_qwen_messages(args, task):
-    gt = resize_square(Image.open(task["gt_image_path"]), args.image_size)
-    gen = resize_square(Image.open(task["generated_image_path"]), args.image_size)
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": gt},
-                {"type": "image", "image": gen},
-                {"type": "text", "text": build_feedback_prompt(task["metadata_text"])},
-            ],
-        }
-    ]
-
-
-@torch.no_grad()
-def qwen_local_feedback_batch(args, processor, model, tasks):
-    messages = [build_qwen_messages(args, task) for task in tasks]
-    texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
-    try:
-        from qwen_vl_utils import process_vision_info
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=texts,
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
+        return build_feedback_verifier(
+            backend="openai-chat",
+            model=args.gemini_model,
+            api_url=OPENROUTER_API_URL,
+            api_key=openrouter_api_key(args),
+            temperature=args.vlm_temperature,
+            max_tokens=args.max_new_tokens,
+            retries=args.openrouter_retries,
+            workers=args.vlm_workers,
+            include_caption=args.use_caption,
+            include_metadata=False,
+            image_size=args.image_size,
         )
-    except Exception:
-        images = []
-        for msg in messages:
-            images.extend([item["image"] for item in msg[0]["content"] if item["type"] == "image"])
-        inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
+    if args.vlm == "qwen-vllm":
+        return build_feedback_verifier(
+            backend="qwen-vllm",
+            model=args.vllm_model,
+            api_url=args.vllm_base_url,
+            api_key=args.vllm_api_key,
+            temperature=args.vlm_temperature,
+            max_tokens=args.max_new_tokens,
+            retries=args.openrouter_retries,
+            workers=args.vlm_batch_size,
+            enable_thinking=args.enable_thinking,
+            include_caption=args.use_caption,
+            include_metadata=False,
+            image_size=args.image_size,
+        )
+    if args.vlm == "qwen-local":
+        return build_feedback_verifier(
+            backend="qwen-local",
+            model=args.qwen_model,
+            device=device,
+            qwen_dtype=args.qwen_dtype,
+            device_map=args.qwen_device_map,
+            temperature=args.vlm_temperature,
+            max_tokens=args.max_new_tokens,
+            workers=args.vlm_batch_size,
+            enable_thinking=args.enable_thinking,
+            include_caption=args.use_caption,
+            include_metadata=False,
+            image_size=args.image_size,
+        )
+    raise ValueError(args.vlm)
 
-    model_device = next(model.parameters()).device
-    inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
-    generated = model.generate(
-        **inputs,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.vlm_temperature > 0,
-        temperature=args.vlm_temperature if args.vlm_temperature > 0 else None,
+
+def task_feedback_images(args, task):
+    return (
+        resize_square(Image.open(task["gt_image_path"]), args.image_size),
+        resize_square(Image.open(task["generated_image_path"]), args.image_size),
     )
-    input_len = inputs["input_ids"].shape[1]
-    generated = generated[:, input_len:]
-    return processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
 
-def run_qwen_local_feedback(args, tasks, jsonl_path, failures_path, device):
-    processor, model = load_qwen_local(args, device)
-    completed = 0
-    for start in tqdm(range(0, len(tasks), args.vlm_batch_size), desc="qwen local feedback", unit="batch"):
+def run_feedback(args, tasks, jsonl_path, failures_path, device):
+    verifier = build_dataset_feedback_verifier(args, device)
+    usage_totals = {}
+    for start in tqdm(range(0, len(tasks), args.vlm_batch_size), desc="vlm feedback", unit="batch"):
         batch = tasks[start:start + args.vlm_batch_size]
         try:
-            feedbacks = qwen_local_feedback_batch(args, processor, model, batch)
-            for task, feedback in zip(batch, feedbacks):
-                append_jsonl(jsonl_path, build_output_row(args, task, feedback.strip(), {}))
+            image_pairs = [task_feedback_images(args, task) for task in batch]
+            results = verifier.verify_batch(
+                [task.get("caption_text") or task["caption"] for task in batch],
+                [task.get("metadata") for task in batch],
+                [pair[0] for pair in image_pairs],
+                [pair[1] for pair in image_pairs],
+            )
+            for task, result in zip(batch, results):
+                if result.ok:
+                    usage = result.token_usage or {}
+                    append_jsonl(jsonl_path, build_output_row(args, task, result.feedback, usage))
+                    for key, value in usage.items():
+                        if isinstance(value, (int, float)):
+                            usage_totals[key] = usage_totals.get(key, 0) + value
+                else:
+                    append_jsonl(failures_path, {**task, "error": result.error, "vlm": args.vlm})
         except Exception as exc:
             for task in batch:
                 append_jsonl(failures_path, {**task, "error": repr(exc), "vlm": args.vlm})
-        completed += len(batch)
-    return {}
+    return usage_totals
 
 
 def preview_grid(args, rows, out_path, max_rows=20):
@@ -762,10 +572,7 @@ def main():
 
     usage_totals = {}
     if pending_feedback:
-        if args.vlm in {"gemini", "qwen-vllm"}:
-            usage_totals = run_remote_feedback(args, pending_feedback, jsonl_path, failures_path)
-        elif args.vlm == "qwen-local":
-            usage_totals = run_qwen_local_feedback(args, pending_feedback, jsonl_path, failures_path, device)
+        usage_totals = run_feedback(args, pending_feedback, jsonl_path, failures_path, device)
 
     all_rows = load_jsonl(jsonl_path)
     manifest.update({

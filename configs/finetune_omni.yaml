@@ -1,0 +1,73 @@
+hydra:
+  job:
+    chdir: false
+
+data:
+  split: train
+  use_disk: true
+  load_meta: true
+  load_images: false
+  load_context: false
+  dataset_config:
+    - name: base
+      dataset_path: /gscratch/scrubbed/sriyash/clevr_dit_dataset_filtered/data.zarr
+      sampling_ratio: 1.0
+    # Uncomment when training image+text feedback/editing examples.
+    # - name: feedback
+    #   dataset_path: /gpfs/scrubbed/sriyash/vlm_feedback_dataset_qwen/data.zarr
+    #   sampling_ratio: 1.0
+
+model:
+  image_width: 480
+  image_height: 320
+  vae: stabilityai/sdxl-vae
+  context_dropout_prob: 0.0
+
+omni:
+  model_name_or_path: Shitao/OmniGen-v1
+  vae: null
+  mixed_precision: bf16
+  gradient_checkpointing: false
+  use_lora: true
+  lora_rank: 128
+  lora_alpha: 128
+  lora_init: gaussian
+  lora_target_modules:
+    - qkv_proj
+    - o_proj
+    - gate_up_proj
+    - down_proj
+  condition_dropout_prob: 0.01
+  max_input_length_limit: 18000
+  use_feedback_images: true
+  keep_raw_resolution: false
+  use_ema: false
+
+train:
+  results_dir: /gscratch/scrubbed/sriyash/OmniGen-clevr
+  experiment_name: clevr_lora_omni_finetune_100k_128lora
+  ckpt: null
+  epochs: 1000
+  global_batch_size: 32
+  global_seed: 0
+  lr: 5e-5
+  lr_schedule: cosine
+  lr_warmup_steps: 5000
+  min_lr: 1e-6
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  ema_decay: 0.0
+  log_every: 100
+  ckpt_every: 5000
+  max_train_steps: 100000
+  adam_weight_decay: 0.01
+
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last: true
+
+wandb:
+  project: DiT-qwen-clevr

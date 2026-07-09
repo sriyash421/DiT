@@ -39,27 +39,6 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
-class LabelEmbedder(nn.Module):
-    def __init__(self, num_classes, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        return torch.where(drop_ids, self.num_classes, labels)
-
-    def forward(self, labels, train, force_drop_ids=None):
-        if (train and self.dropout_prob > 0) or force_drop_ids is not None:
-            labels = self.token_drop(labels, force_drop_ids)
-        return self.embedding_table(labels)
-
-
 class CrossAttention(nn.Module):
     def __init__(self, hidden_size, context_dim, num_heads):
         super().__init__()
@@ -174,7 +153,6 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         if self.text_conditioning:
             self.null_context = nn.Parameter(torch.zeros(1, null_context_len, context_dim))
             self.context_adapter = ContextAdapter(context_dim, hidden_size)
@@ -213,7 +191,6 @@ class DiT(nn.Module):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
@@ -296,8 +273,6 @@ class DiT(nn.Module):
         context_tokens, context_mask, pooled_context = self.adapt_context(context_tokens, context_mask)
         if pooled_context is not None:
             c = c + pooled_context
-        if context_tokens is None and y is not None:
-            c = c + self.y_embedder(y, self.training)
         for block in self.blocks:
             x = block(x, c, context_tokens, context_mask)
         x = self.final_layer(x, c)

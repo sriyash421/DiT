@@ -78,10 +78,11 @@ class ClevrContextDataset(Dataset):
             "images": data["images"] if (self.use_disk and not self.load_images) or self.max_dataset_size is not None else data["images"][:],
             "generated_images": data["generated_images"] if (self.use_disk and not self.load_images) or self.max_dataset_size is not None else data["generated_images"][:],
         }
+        meta_items = meta.items() if hasattr(meta, "items") else ((key, meta[key]) for key in meta.keys())
         if self.load_meta:
-            self._meta = {key: value[:] for key, value in meta.items()}
+            self._meta = {key: value[:] for key, value in meta_items}
         else:
-            self._meta = {key: value for key, value in meta.items()}
+            self._meta = {key: value for key, value in meta_items}
         self._build_limited_caches(data, row_indices)
 
     def _select_indices_from(self, split_ids, split_names):

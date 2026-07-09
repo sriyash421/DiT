@@ -13,15 +13,13 @@ from torch.utils.data.distributed import DistributedSampler
 from clevr_transforms import build_clevr_transform
 from datasets_clevr import ClevrContextDataset, context_collate
 from diffusion import create_diffusion
+from feedback_verifiers import DEFAULT_GEMINI_MODEL, GeminiVerifier, VerificationResult
 from models import DiT_models
 from on_policy import (
-    DEFAULT_GEMINI_MODEL,
-    GeminiVerifier,
     PolicySampler,
     QwenContextEncoder,
     RolloutBuffer,
     RolloutCollector,
-    VerificationResult,
     diffusion_loss,
     load_metadata_for_zarr,
     metadata_by_index,
@@ -102,12 +100,24 @@ class FakeVerifier:
             for caption in captions
         ]
 
+    def verify_history_batch(self, captions, metadata, gt_images, attempt_images, feedback_histories):
+        del metadata, gt_images, attempt_images
+        return [
+            VerificationResult(ok=True, feedback=f"fix {caption} step {len(history)}", token_count=11)
+            for caption, history in zip(captions, feedback_histories)
+        ]
+
 
 class FakeContextEncoder:
     def encode_feedback(self, captions, metadata, feedback, attempt_images):
         del metadata, feedback, attempt_images
         tokens = torch.arange(len(captions) * 6, dtype=torch.float32).reshape(len(captions), 2, 3)
         return tokens, torch.ones(len(captions), 2, dtype=torch.bool)
+
+    def encode_history(self, captions, feedback_histories, attempt_image_histories):
+        del feedback_histories, attempt_image_histories
+        tokens = torch.arange(len(captions) * 9, dtype=torch.float32).reshape(len(captions), 3, 3)
+        return tokens, torch.ones(len(captions), 3, dtype=torch.bool)
 
 
 class FakeVAE:
@@ -223,6 +233,41 @@ def test_rollout_collector_writes_rank_shard_records_and_attempt_pngs(tmp_path):
     assert (tmp_path / "step_000001" / "rank_000" / "attempts" / "000000.png").exists()
     assert (tmp_path / "step_000001" / "rank_000" / "attempts" / "000001.png").exists()
     assert dataset[0]["gt_path"].endswith("gt/000000.png")
+
+
+def test_rollout_collector_multi_step_writes_step_records_and_histories(tmp_path):
+    batch = {
+        "image": torch.zeros(2, 3, 8, 8),
+        "context_tokens": torch.ones(2, 2, 3),
+        "context_mask": torch.ones(2, 2, dtype=torch.bool),
+        "caption": ["a", "b"],
+        "metadata_index": torch.tensor([0, 1]),
+    }
+    collector = RolloutCollector(
+        model="ema-model",
+        vae=FakeVAE(),
+        sampler=FakeSampler(),
+        verifier=FakeVerifier(),
+        context_encoder=FakeContextEncoder(),
+        metadata_rows=[{"id": 0}, {"id": 1}],
+        rollout_length=3,
+    )
+
+    stats = collector.collect(
+        [batch],
+        tmp_path / "step_000001" / "rank_000",
+        sample_count=2,
+        device=torch.device("cpu"),
+    )
+    dataset = RolloutBuffer(tmp_path / "step_000001")
+
+    assert stats == {"attempted": 6, "success": 6, "failed": 0, "gemini_tokens": 66}
+    assert len(dataset) == 6
+    assert [dataset[idx]["step_index"] for idx in range(len(dataset))] == [0, 0, 1, 1, 2, 2]
+    assert dataset[0]["feedback_history"] == []
+    assert dataset[2]["feedback_history"] == ["fix a step 0"]
+    assert len(dataset[4]["history_attempt_paths"]) == 2
+    assert Path(dataset[4]["attempt_path"]).exists()
 
 
 def test_distributed_sampler_partitions_merged_rollout_buffer(tmp_path):
@@ -386,8 +431,6 @@ def model_stack(runtime_config, base_batch):
     ).to(device)
     model.load_state_dict(load_checkpoint(runtime_config["ckpt"]), strict=False)
     model.train()
-    requires_grad(model.y_embedder, False)
-
     ema = DiT_models[runtime_config["model_name"]](
         input_size=runtime_config["image_size"] // 8,
         num_classes=1000,

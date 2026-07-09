@@ -59,6 +59,19 @@ def load_checkpoint_and_config(path, use_ema):
     return state_dict, config
 
 
+def load_state_dict_strict_false(model, state_dict):
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in model_state and model_state[key].shape != value.shape:
+            skipped.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        compatible_state[key] = value
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    return missing, unexpected, skipped
+
+
 def config_get(config, path, default=None):
     value = config
     for key in path.split("."):
@@ -268,7 +281,15 @@ def main(args):
         })
 
     model = DiT_models[args.model](**model_kwargs).to(device)
-    model.load_state_dict(state_dict, strict=True)
+    missing, unexpected, skipped = load_state_dict_strict_false(model, state_dict)
+    if skipped:
+        print(f"Skipped {len(skipped)} checkpoint tensors with incompatible shapes:")
+        for key, checkpoint_shape, model_shape in skipped:
+            print(f"  {key}: checkpoint={checkpoint_shape}, model={model_shape}")
+    if missing:
+        print(f"Missing checkpoint keys: {missing}")
+    if unexpected:
+        print(f"Unexpected checkpoint keys: {unexpected}")
     model.eval()
 
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)

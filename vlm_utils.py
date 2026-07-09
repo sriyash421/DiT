@@ -64,15 +64,29 @@ def metadata_for_row(row, metadata_rows, metadata_by_image_path):
     return metadata_by_image_path.get(row.get("image_path") or row.get("source_image_path"))
 
 
-def build_context_text(caption, metadata=None, feedback=None):
+def build_context_text(caption, metadata=None, feedback=None, include_metadata=True):
     parts = []
     if caption:
         parts.append(f"Caption: {caption}")
-    meta_text = compact_metadata_text(metadata)
+    meta_text = compact_metadata_text(metadata) if include_metadata else None
     if meta_text:
         parts.append(f"CLEVR metadata:\n{meta_text}")
     if feedback:
         parts.append(f"Feedback: {feedback}")
+    return "\n\n".join(parts)
+
+
+def build_history_context_text(caption, feedback_history=None):
+    parts = []
+    if caption:
+        parts.append(f"Caption: {caption}")
+    feedback_history = feedback_history or []
+    if feedback_history:
+        history_lines = ["Generated-image feedback history:"]
+        for idx, feedback in enumerate(feedback_history):
+            history_lines.append(f"Image {idx}: previous generated attempt.")
+            history_lines.append(f"Feedback {idx}: {feedback}")
+        parts.append("\n".join(history_lines))
     return "\n\n".join(parts)
 
 
@@ -81,7 +95,11 @@ def build_messages(texts, images=None):
     messages = []
     for text, image in zip(texts, images):
         content = []
-        if image is not None:
+        if isinstance(image, (list, tuple)):
+            for item in image:
+                if item is not None:
+                    content.append({"type": "image", "image": item.convert("RGB")})
+        elif image is not None:
             content.append({"type": "image", "image": image.convert("RGB")})
         content.append({"type": "text", "text": text})
         messages.append([{"role": "user", "content": content}])

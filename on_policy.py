@@ -1,23 +1,13 @@
-import base64
-import concurrent.futures
-import io
 import json
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import requests
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
 from datasets_clevr import pad_contexts
-from vlm_utils import build_context_text, compact_metadata_text, encode_contexts, load_vlm
-
-
-GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+from vlm_utils import build_context_text, build_history_context_text, encode_contexts, load_vlm
 
 
 def unwrap_model(model):
@@ -35,12 +25,6 @@ def normalized_tensor_to_pil(x):
     x = x.detach().float().cpu().clamp(-1, 1)
     x = ((x + 1) / 2 * 255).round().byte()
     return Image.fromarray(x.permute(1, 2, 0).numpy(), mode="RGB")
-
-
-def pil_to_png_base64(image):
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def load_metadata_for_zarr(dataset_path):
@@ -75,142 +59,6 @@ def _torch_load(path, map_location="cpu"):
         return torch.load(path, map_location=map_location)
 
 
-def build_feedback_prompt(metadata=None):
-    metadata_block = ""
-    metadata_text = compact_metadata_text(metadata)
-    if metadata_text:
-        metadata_block = f"Original CLEVR metadata, if useful:\n{metadata_text}\n\n"
-    # return (
-    #     "You are evaluating an text-conditioned image generation model. "
-    #     "The first image is the ground-truth image. The second image is the current generated image.\n\n"
-    #     f"{metadata_block}"
-    #     "Return exactly one short corrective feedback sentence. Do not use bullets. "
-    #     "Do not mention anything already correct. Do not praise the image. "
-    #     "Choose the highest-priority needed edit using this priority order: "
-    #     "1) add missing objects,"
-    #     "2) fix object shape or color, "
-    #     "3) fix object position or depth ordering, "
-    #     "4) fix material/texture, "
-    #     "Use an imperative edit, for example: 'Add the small gray sphere', 'Move the gray sphere behind the yellow sphere.'"
-    # )
-    return (
-        "You are evaluating an text-conditioned image generation model. "
-        "The first image is the ground-truth image. The second image is the current generated image.\n\n"
-        f"{metadata_block}"
-        "Return exactly one short corrective feedback sentence. Do not use bullets. "
-        "The sentence must describe only one visual edit. "
-        "Do not combine multiple edits with 'and', commas, semicolons, or multiple clauses. "
-        "Do not mention anything already correct. Do not praise the image. "
-        "Choose the highest-priority needed edit using this priority order: "
-        "1) add missing objects,"
-        "2) fix object shape or color, "
-        "3) fix object position or depth ordering, "
-        "4) fix material/texture, "
-        "If multiple changes are needed, output only the first one by this priority order. "
-        "Use an imperative edit, for example: 'Add the small yellow cylinder.' "
-        "or 'Replace the purple cube with a purple sphere.'"
-    )
-
-
-@dataclass
-class VerificationResult:
-    ok: bool
-    feedback: str = ""
-    token_count: int = 0
-    error: str = ""
-
-
-class Verifier:
-    def verify_batch(self, captions, metadata, gt_images, attempt_images):
-        raise NotImplementedError
-
-
-class GeminiVerifier(Verifier):
-    def __init__(
-        self,
-        api_key,
-        model=DEFAULT_GEMINI_MODEL,
-        api_url=None,
-        temperature=0.0,
-        max_tokens=96,
-        retries=2,
-        timeout=120,
-        workers=8,
-    ):
-        if not api_key:
-            raise ValueError("GeminiVerifier requires an API key.")
-        self.api_key = api_key
-        self.model = model
-        self.api_url = api_url or GEMINI_API_URL_TEMPLATE
-        self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens)
-        self.retries = int(retries)
-        self.timeout = int(timeout)
-        self.workers = int(workers)
-
-    def _tokens_from_usage(self, usage):
-        return int(usage.get("totalTokenCount", 0) or 0)
-
-    def _verify_one(self, metadata, gt_image, attempt_image):
-        headers = {"Content-Type": "application/json"}
-        url = self.api_url.format(model=self.model)
-        params = {"key": self.api_key}
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": build_feedback_prompt(metadata)},
-                    {"text": "Ground-truth image:"},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": pil_to_png_base64(gt_image),
-                        }
-                    },
-                    {"text": "Current generated image:"},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": pil_to_png_base64(attempt_image),
-                        }
-                    },
-                ],
-            }],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "maxOutputTokens": self.max_tokens,
-            },
-        }
-        for attempt in range(self.retries + 1):
-            try:
-                response = requests.post(url, headers=headers, params=params, json=payload, timeout=self.timeout)
-                response.raise_for_status()
-                result = response.json()
-                parts = result["candidates"][0]["content"].get("parts", [])
-                feedback = "".join(part.get("text", "") for part in parts).strip()
-                if not feedback:
-                    raise ValueError("empty feedback")
-                return VerificationResult(
-                    ok=True,
-                    feedback=feedback,
-                    token_count=self._tokens_from_usage(result.get("usageMetadata", {}) or {}),
-                )
-            except Exception as exc:
-                if attempt >= self.retries:
-                    return VerificationResult(ok=False, error=repr(exc))
-                time.sleep(2 ** attempt)
-        return VerificationResult(ok=False, error="unreachable")
-
-    def verify_batch(self, captions, metadata, gt_images, attempt_images):
-        del captions
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = [
-                executor.submit(self._verify_one, meta, gt, attempt)
-                for meta, gt, attempt in zip(metadata, gt_images, attempt_images)
-            ]
-            return [future.result() for future in futures]
-
-
 class ContextEncoder:
     def encode_feedback(self, captions, metadata, feedback, attempt_images):
         raise NotImplementedError
@@ -225,16 +73,18 @@ class QwenContextEncoder(ContextEncoder):
         device_map="auto",
         max_length=1024,
         out_dtype=torch.float16,
+        include_metadata=True,
     ):
         self.device = torch.device(device)
         self.max_length = int(max_length)
         self.out_dtype = out_dtype
+        self.include_metadata = bool(include_metadata)
         self.processor, self.model = load_vlm(model_id, self.device, dtype=vlm_dtype, device_map=device_map)
 
     @torch.no_grad()
     def encode_feedback(self, captions, metadata, feedback, attempt_images):
         texts = [
-            build_context_text(caption, meta, fb)
+            build_context_text(caption, meta, fb, include_metadata=self.include_metadata)
             for caption, meta, fb in zip(captions, metadata, feedback)
         ]
         tokens, masks = encode_contexts(
@@ -243,6 +93,24 @@ class QwenContextEncoder(ContextEncoder):
             texts,
             self.device,
             images=attempt_images,
+            max_length=self.max_length,
+            out_dtype=self.out_dtype,
+        )
+        contexts = [token[mask.bool()].contiguous() for token, mask in zip(tokens, masks)]
+        return pad_contexts(contexts)
+
+    @torch.no_grad()
+    def encode_history(self, captions, feedback_histories, attempt_image_histories):
+        texts = [
+            build_history_context_text(caption, history)
+            for caption, history in zip(captions, feedback_histories)
+        ]
+        tokens, masks = encode_contexts(
+            self.processor,
+            self.model,
+            texts,
+            self.device,
+            images=attempt_image_histories,
             max_length=self.max_length,
             out_dtype=self.out_dtype,
         )
@@ -400,6 +268,7 @@ class RolloutCollector:
         verifier,
         context_encoder,
         metadata_rows,
+        rollout_length=1,
     ):
         self.model = model
         self.vae = vae
@@ -407,9 +276,16 @@ class RolloutCollector:
         self.verifier = verifier
         self.context_encoder = context_encoder
         self.metadata_rows = metadata_rows
+        self.rollout_length = max(1, int(rollout_length))
 
     @torch.no_grad()
     def collect(self, loader, output_dir, sample_count, device, seed=None, progress=None, data_sampler=None, epoch=0):
+        if self.rollout_length <= 1:
+            return self._collect_one_step(loader, output_dir, sample_count, device, seed, progress, data_sampler, epoch)
+        return self._collect_multi_step(loader, output_dir, sample_count, device, seed, progress, data_sampler, epoch)
+
+    @torch.no_grad()
+    def _collect_one_step(self, loader, output_dir, sample_count, device, seed=None, progress=None, data_sampler=None, epoch=0):
         output_dir = Path(output_dir)
         attempts_dir = output_dir / "attempts"
         gt_dir = output_dir / "gt"
@@ -505,6 +381,141 @@ class RolloutCollector:
         torch.save({"records": records, "stats": stats}, output_dir / "records.pt")
         return stats
 
+    @torch.no_grad()
+    def _collect_multi_step(self, loader, output_dir, sample_count, device, seed=None, progress=None, data_sampler=None, epoch=0):
+        output_dir = Path(output_dir)
+        attempts_dir = output_dir / "attempts"
+        gt_dir = output_dir / "gt"
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        gt_dir.mkdir(parents=True, exist_ok=True)
+        records = []
+        base_attempted = 0
+        sampled_attempts = 0
+        failed = 0
+        token_count = 0
+        current_epoch = int(epoch)
+        if data_sampler is not None:
+            data_sampler.set_epoch(current_epoch)
+        iterator = iter(loader)
+
+        while base_attempted < sample_count:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                current_epoch += 1
+                if data_sampler is not None:
+                    data_sampler.set_epoch(current_epoch)
+                iterator = iter(loader)
+                batch = next(iterator)
+            remaining = int(sample_count) - base_attempted
+            batch = _slice_batch(batch, min(remaining, int(batch["image"].shape[0])))
+            batch_size = int(batch["image"].shape[0])
+            if batch_size == 0:
+                continue
+
+            x_img = batch["image"].to(device)
+            base_tokens = batch["context_tokens"].to(device)
+            base_mask = batch["context_mask"].to(device)
+            captions = batch["caption"]
+            metadata = metadata_by_index(self.metadata_rows, batch["metadata_index"].tolist())
+            gt_images = [normalized_tensor_to_pil(image) for image in batch["image"]]
+            x_latents = self.vae.encode(x_img).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+
+            active = list(range(batch_size))
+            current_tokens = base_tokens
+            current_mask = base_mask
+            histories = [[] for _ in range(batch_size)]
+            history_paths = [[] for _ in range(batch_size)]
+            history_images = [[] for _ in range(batch_size)]
+
+            for step_idx in range(self.rollout_length):
+                if not active:
+                    break
+                _, attempt_images = self.sampler.sample(
+                    self.model,
+                    self.vae,
+                    current_tokens,
+                    current_mask,
+                    device,
+                    seed=None if seed is None else int(seed) + base_attempted * self.rollout_length + step_idx,
+                )
+                sampled_attempts += len(active)
+                active_captions = [captions[idx] for idx in active]
+                active_metadata = [metadata[idx] for idx in active]
+                active_gt_images = [gt_images[idx] for idx in active]
+                active_histories = [list(histories[idx]) for idx in active]
+                results = self.verifier.verify_history_batch(
+                    active_captions,
+                    active_metadata,
+                    active_gt_images,
+                    attempt_images,
+                    active_histories,
+                )
+                token_count += sum(int(result.token_count) for result in results)
+                success_positions = [idx for idx, result in enumerate(results) if result.ok]
+                failed += len(results) - len(success_positions)
+
+                next_active = []
+                next_captions = []
+                next_histories = []
+                next_history_images = []
+                for pos in success_positions:
+                    batch_idx = active[pos]
+                    result = results[pos]
+                    record_id = len(records)
+                    attempt_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.png"
+                    gt_path = gt_dir / f"{record_id:06d}.png"
+                    attempt_images[pos].save(attempt_path)
+                    if not gt_path.exists():
+                        gt_images[batch_idx].save(gt_path)
+
+                    base_valid = base_mask[batch_idx].detach().cpu().bool()
+                    context_valid = current_mask[pos].detach().cpu().bool()
+                    records.append({
+                        "x_latent": x_latents[batch_idx].detach().cpu().float(),
+                        "base_context_tokens": base_tokens[batch_idx].detach().cpu()[base_valid].to(torch.float16),
+                        "adaptive_context_tokens": current_tokens[pos].detach().cpu()[context_valid].to(torch.float16),
+                        "caption": captions[batch_idx],
+                        "feedback": result.feedback,
+                        "feedback_history": list(histories[batch_idx]),
+                        "history_attempt_paths": list(history_paths[batch_idx]),
+                        "step_index": int(step_idx),
+                        "metadata_index": int(batch["metadata_index"][batch_idx].item()),
+                        "gt_path": str(gt_path),
+                        "attempt_path": str(attempt_path),
+                    })
+
+                    histories[batch_idx].append(result.feedback)
+                    history_paths[batch_idx].append(str(attempt_path))
+                    history_images[batch_idx].append(attempt_images[pos])
+                    next_active.append(batch_idx)
+                    next_captions.append(captions[batch_idx])
+                    next_histories.append(list(histories[batch_idx]))
+                    next_history_images.append(list(history_images[batch_idx]))
+
+                if step_idx + 1 >= self.rollout_length or not next_active:
+                    active = next_active
+                    break
+                current_tokens, current_mask = self.context_encoder.encode_history(
+                    next_captions,
+                    next_histories,
+                    next_history_images,
+                )
+                active = next_active
+
+            base_attempted += batch_size
+            if progress is not None:
+                progress.update(batch_size)
+
+        stats = {
+            "attempted": int(sampled_attempts),
+            "success": int(len(records)),
+            "failed": int(failed),
+            "gemini_tokens": int(token_count),
+        }
+        torch.save({"records": records, "stats": stats}, output_dir / "records.pt")
+        return stats
+
 
 class OnPolicyTrainer:
     def __init__(
@@ -525,20 +536,26 @@ class OnPolicyTrainer:
         base_mask = batch["base_context_mask"].to(device)
         adaptive_tokens = batch["adaptive_context_tokens"].to(device)
         adaptive_mask = batch["adaptive_context_mask"].to(device)
-        base_loss = diffusion_loss(
-            self.model,
-            self.train_diffusion,
-            x_latent,
-            base_tokens,
-            base_mask,
-        )
-        feedback_loss = diffusion_loss(
-            self.model,
-            self.train_diffusion,
-            x_latent,
-            adaptive_tokens,
-            adaptive_mask,
-        )
+        if self.base_weight:
+            base_loss = diffusion_loss(
+                self.model,
+                self.train_diffusion,
+                x_latent,
+                base_tokens,
+                base_mask,
+            )
+        else:
+            base_loss = x_latent.new_tensor(0.0)
+        if self.feedback_weight:
+            feedback_loss = diffusion_loss(
+                self.model,
+                self.train_diffusion,
+                x_latent,
+                adaptive_tokens,
+                adaptive_mask,
+            )
+        else:
+            feedback_loss = x_latent.new_tensor(0.0)
         loss = self.feedback_weight * feedback_loss + self.base_weight * base_loss
         return loss, {
             "loss": float(loss.item()),
@@ -561,4 +578,3 @@ def save_trace_grid(path, gt_image, attempt1, feedback, attempt2):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     out.save(path)
-

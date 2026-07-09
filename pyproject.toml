@@ -81,6 +81,7 @@ dependencies = [
     "nvidia-nvtx-cu12==12.4.127",
     "omegaconf==2.3.1",
     "packaging==26.2",
+    "peft==0.13.2",
     "pillow==12.2.0",
     "platformdirs==4.10.0",
     "pluggy==1.6.0",

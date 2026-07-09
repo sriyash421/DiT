@@ -22,9 +22,9 @@ import wandb
 from clevr_transforms import build_clevr_transform
 from datasets_clevr import ClevrContextDataset, context_collate
 from diffusion import create_diffusion
+from feedback_verifiers import GeminiVerifier, build_feedback_verifier
 from models import DiT_models
 from on_policy import (
-    GeminiVerifier,
     OnPolicyTrainer,
     PolicySampler,
     QwenContextEncoder,
@@ -53,17 +53,36 @@ def cleanup():
 
 
 def build_verifier(cfg):
-    api_key = os.getenv(cfg.verifier.api_key_env)
-    return GeminiVerifier(
-        api_key=api_key,
-        model=cfg.verifier.model,
-        api_url=cfg.verifier.api_url,
-        temperature=cfg.verifier.temperature,
-        max_tokens=cfg.verifier.max_tokens,
-        retries=cfg.verifier.retries,
-        timeout=cfg.verifier.timeout,
-        workers=cfg.verifier.workers,
-    )
+    name = cfg.verifier.get("name", "gemini")
+    if name in {"gemini", "gemini-native"}:
+        api_key = os.getenv(cfg.verifier.api_key_env)
+        return GeminiVerifier(
+            api_key=api_key,
+            model=cfg.verifier.model,
+            api_url=cfg.verifier.api_url,
+            temperature=cfg.verifier.temperature,
+            max_tokens=cfg.verifier.max_tokens,
+            retries=cfg.verifier.retries,
+            timeout=cfg.verifier.timeout,
+            workers=cfg.verifier.workers,
+        )
+    if name in {"qwen-vllm", "openai-chat"}:
+        return build_feedback_verifier(
+            backend=name,
+            model=cfg.verifier.model,
+            api_url=cfg.verifier.api_url,
+            api_key=cfg.verifier.get("api_key", "EMPTY"),
+            temperature=cfg.verifier.temperature,
+            max_tokens=cfg.verifier.max_tokens,
+            retries=cfg.verifier.retries,
+            timeout=cfg.verifier.timeout,
+            workers=cfg.verifier.workers,
+            enable_thinking=cfg.verifier.get("enable_thinking", False),
+            include_caption=cfg.verifier.get("include_caption", True),
+            include_metadata=cfg.verifier.get("include_metadata", False),
+            image_size=cfg.verifier.get("image_size", None),
+        )
+    raise ValueError(f"Unsupported verifier.name: {name}")
 
 
 def samples_for_rank(global_count, rank, world_size):
@@ -312,53 +331,116 @@ def run_adaptive_eval(
     batch = context_collate(items)
     metadata = metadata_by_index(metadata_rows, batch["metadata_index"].tolist())
     gt_images = [val_dataset.image_for_row(val_dataset.indices[idx]) for idx in indices]
-    _, attempt1_images = sampler.sample(
-        module,
-        vae,
-        batch["context_tokens"],
-        batch["context_mask"],
-        device,
-        seed=cfg.eval.seed + step,
-    )
-    results = verifier.verify_batch(batch["caption"], metadata, gt_images, attempt1_images)
-    eval_tokens = sum(int(result.token_count) for result in results)
-    success_indices = [idx for idx, result in enumerate(results) if result.ok]
-    if not success_indices:
-        return eval_tokens, log_step
-    feedbacks = [results[idx].feedback for idx in success_indices]
-    adaptive_tokens, adaptive_mask = context_encoder.encode_feedback(
-        [batch["caption"][idx] for idx in success_indices],
-        [metadata[idx] for idx in success_indices],
-        feedbacks,
-        [attempt1_images[idx] for idx in success_indices],
-    )
-    _, attempt2_images = sampler.sample(
-        module,
-        vae,
-        adaptive_tokens,
-        adaptive_mask,
-        device,
-        seed=cfg.eval.seed + step + 1,
-    )
+    eval_steps = max(1, int(cfg.eval.get("steps", cfg.rollout.get("length", 1))))
+    histories = [[] for _ in indices]
+    history_images = [[] for _ in indices]
+    active = list(range(len(indices)))
+    current_tokens = batch["context_tokens"]
+    current_mask = batch["context_mask"]
+    traces = [[] for _ in indices]
+    eval_tokens = 0
+    distance_rows = []
+
+    for eval_step in range(eval_steps):
+        if not active:
+            break
+        _, attempt_images = sampler.sample(
+            module,
+            vae,
+            current_tokens,
+            current_mask,
+            device,
+            seed=cfg.eval.seed + step * 1000 + eval_step,
+        )
+        active_captions = [batch["caption"][idx] for idx in active]
+        active_metadata = [metadata[idx] for idx in active]
+        active_gt_images = [gt_images[idx] for idx in active]
+        score_results = verifier.score_distance_batch(
+            active_captions,
+            active_metadata,
+            active_gt_images,
+            attempt_images,
+        )
+        if score_results:
+            eval_tokens += sum(int(result.token_count) for result in score_results)
+        for pos, batch_idx in enumerate(active):
+            score = None
+            if score_results and pos < len(score_results) and score_results[pos].ok:
+                score = score_results[pos].score
+            traces[batch_idx].append({
+                "image": attempt_images[pos],
+                "feedback_used": histories[batch_idx][-1] if histories[batch_idx] else "",
+                "distance": score,
+            })
+            if score is not None:
+                distance_rows.append((eval_step, float(score)))
+
+        if eval_step + 1 >= eval_steps:
+            break
+        active_histories = [list(histories[idx]) for idx in active]
+        results = verifier.verify_history_batch(
+            active_captions,
+            active_metadata,
+            active_gt_images,
+            attempt_images,
+            active_histories,
+        )
+        eval_tokens += sum(int(result.token_count) for result in results)
+        success_positions = [idx for idx, result in enumerate(results) if result.ok]
+        if not success_positions:
+            break
+        next_active = []
+        next_captions = []
+        next_histories = []
+        next_history_images = []
+        for pos in success_positions:
+            batch_idx = active[pos]
+            histories[batch_idx].append(results[pos].feedback)
+            history_images[batch_idx].append(attempt_images[pos])
+            next_active.append(batch_idx)
+            next_captions.append(batch["caption"][batch_idx])
+            next_histories.append(list(histories[batch_idx]))
+            next_history_images.append(list(history_images[batch_idx]))
+        current_tokens, current_mask = context_encoder.encode_history(
+            next_captions,
+            next_histories,
+            next_history_images,
+        )
+        active = next_active
+
     trace_dir = Path(out_dir) / "adaptive_eval"
     table = wandb.Table(columns=["step", "eval_index", "caption", "feedback", "trace"])
-    for out_idx, batch_idx in enumerate(success_indices):
+    for batch_idx, eval_index in enumerate(indices):
+        if not traces[batch_idx]:
+            continue
         grid_path = trace_dir / f"step_{step:07d}_idx_{indices[batch_idx]:06d}.png"
-        save_trace_grid(
-            grid_path,
-            gt_images[batch_idx],
-            attempt1_images[batch_idx],
-            results[batch_idx].feedback,
-            attempt2_images[out_idx],
-        )
+        first_attempt = traces[batch_idx][0]["image"]
+        last_attempt = traces[batch_idx][-1]["image"]
+        feedback_text = "\n".join(histories[batch_idx])
+        save_trace_grid(grid_path, gt_images[batch_idx], first_attempt, feedback_text, last_attempt)
         table.add_data(
             step,
-            indices[batch_idx],
+            eval_index,
             batch["caption"][batch_idx],
-            results[batch_idx].feedback,
+            feedback_text,
             wandb.Image(str(grid_path)),
         )
-    wandb.log({"eval/adaptive_trace": table}, step=log_step)
+    metrics = {"eval/adaptive_trace": table}
+    if distance_rows:
+        by_step = {}
+        for eval_step, score in distance_rows:
+            by_step.setdefault(eval_step, []).append(score)
+        for eval_step, values in by_step.items():
+            metrics[f"eval/distance_step_{eval_step}"] = sum(values) / len(values)
+        best_scores = []
+        for row_trace in traces:
+            scores = [entry["distance"] for entry in row_trace if entry["distance"] is not None]
+            if scores:
+                best_scores.append(min(scores))
+        if best_scores:
+            metrics["eval/best_distance"] = sum(best_scores) / len(best_scores)
+            metrics["eval/best_aligned_score"] = sum(1.0 / (1.0 + score) for score in best_scores) / len(best_scores)
+    wandb.log(metrics, step=log_step)
     log_step += 1
     return eval_tokens, log_step
 
@@ -398,6 +480,7 @@ def run_on_policy_loop(
         verifier=verifier,
         context_encoder=context_encoder,
         metadata_rows=metadata_rows,
+        rollout_length=cfg.rollout.get("length", 1),
     )
     trainer = OnPolicyTrainer(
         model=model,
@@ -460,6 +543,7 @@ def run_on_policy_loop(
                 "rollout/samples_per_sec": rollout_samples_per_sec,
                 "rollout/local_samples_per_rank": local_samples,
                 "rollout/samples": rollout_samples,
+                "rollout/batch_size_per_rank": int(loader.batch_size or 0),
                 "train/updates_per_rollout": updates_per_rollout,
                 "rollout/use_ema": float(bool(cfg.rollout.use_ema)),
                 "generation/ddim_steps": int(cfg.sampler.num_sampling_steps),
@@ -647,6 +731,8 @@ def main(cfg):
     validate_startup_config(cfg)
     dist.init_process_group("nccl")
     assert cfg.train.global_batch_size % dist.get_world_size() == 0, "Batch size must be divisible by world size."
+    rollout_global_batch_size = int(cfg.rollout.get("batch_size", cfg.train.global_batch_size))
+    assert rollout_global_batch_size % dist.get_world_size() == 0, "Rollout batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     torch.cuda.set_device(device)
@@ -704,8 +790,6 @@ def main(cfg):
         logger.info(f"Unexpected keys: {unexpected}")
     else:
         logger.info("No train.ckpt provided; starting from random initialization before pretraining.")
-    requires_grad(model.y_embedder, False)
-
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=False)
@@ -729,6 +813,7 @@ def main(cfg):
         device_map=cfg.context_encoder.device_map,
         max_length=cfg.context_encoder.max_length,
         out_dtype=torch.float16,
+        include_metadata=cfg.context_encoder.get("include_metadata", True),
     )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -750,6 +835,14 @@ def main(cfg):
         seed=cfg.train.global_seed,
         drop_last=cfg.dataloader.drop_last,
     )
+    rollout_sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(),
+        rank=rank,
+        shuffle=True,
+        seed=cfg.train.global_seed,
+        drop_last=False,
+    )
     loader = DataLoader(
         dataset,
         **dataloader_kwargs(
@@ -758,6 +851,17 @@ def main(cfg):
             shuffle=False,
             sampler=train_sampler,
             drop_last=cfg.dataloader.drop_last,
+            collate_fn=context_collate,
+        ),
+    )
+    rollout_loader = DataLoader(
+        dataset,
+        **dataloader_kwargs(
+            cfg.dataloader,
+            batch_size=rollout_global_batch_size // dist.get_world_size(),
+            shuffle=False,
+            sampler=rollout_sampler,
+            drop_last=False,
             collate_fn=context_collate,
         ),
     )
@@ -819,8 +923,8 @@ def main(cfg):
         context_encoder=context_encoder,
         train_diffusion=train_diffusion,
         metadata_rows=metadata_rows,
-        loader=loader,
-        train_sampler=train_sampler,
+        loader=rollout_loader,
+        train_sampler=rollout_sampler,
         opt=finetune_opt,
         scheduler=finetune_scheduler,
         val_dataset=val_dataset,

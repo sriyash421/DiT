@@ -111,8 +111,6 @@ def main(cfg):
         logger.info(f"Unexpected keys: {unexpected}")
     else:
         logger.info("Training from scratch.")
-    requires_grad(model.y_embedder, False)
-
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=False)
