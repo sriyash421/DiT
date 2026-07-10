@@ -1,0 +1,13 @@
+_target_: verifiers.vllm_qwen.VLLMQwenVerifier
+api_url: http://localhost:8000/v1
+api_key: EMPTY
+model: Qwen/Qwen3.5-27B
+temperature: 0.0
+max_tokens: 64
+retries: 2
+timeout: 180
+workers: 64
+enable_thinking: false
+include_caption: true
+include_metadata: false
+image_size: 256

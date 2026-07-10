@@ -1,0 +1,37 @@
+defaults:
+  - dataset: clevr_base
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+ckpt: ???
+use_ema: true
+out_dir: results/eval_generation
+
+model:
+  _target_: models.qwen_dit.QwenDiT
+  name: DiT-L/4
+  image_size: 256
+  vae: stabilityai/sdxl-vae
+  context_dropout_prob: 0.0
+
+splits: [train, val]
+num_samples: 100
+batch_size: 25
+seed: 0
+sample_seed: 1234
+
+sampling:
+  num_sampling_steps: 100
+  cfg_scale: 1.0
+  ddim_eta: 0.0
+
+scorer:
+  workers: 16
+  max_tokens: 16
+
+wandb:
+  project: DiT-qwen-clevr
+  name: null

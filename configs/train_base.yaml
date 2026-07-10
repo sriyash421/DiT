@@ -1,59 +1,60 @@
+defaults:
+  - dataset: clevr_base
+  - _self_
+
 hydra:
   job:
     chdir: false
 
-data:
-  split: train
-  use_disk: true
-  load_meta: true
-  load_images: false
-  load_context: false
-  dataset_config:
-    - name: base
-      dataset_path: /gpfs/scrubbed/sriyash/clevr_dit_dataset/data.zarr
-      sampling_ratio: 1.0
+ckpt: null
+results_dir: /gscratch/scrubbed/sriyash/DiT-qwen-clevr-base
+experiment_name: base_l4
 
 model:
-  name: DiT-S/4
+  _target_: models.qwen_dit.QwenDiT
+  name: DiT-L/4
   image_size: 256
-  num_classes: 1000
   vae: stabilityai/sdxl-vae
-  context_dropout_prob: 0.1
+  context_dropout_prob: 0.0
+  context_encoder:
+    freeze_encoder: false
+    model_id: Qwen/Qwen3.5-4B
+    dtype: bfloat16
+    max_length: 4096
+    lora_rank: 16
+    lora_alpha: 16
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 
-train:
-  results_dir: /gpfs/scrubbed/sriyash/DiT-qwen-clevr-base
-  experiment_name: base_s4
-  ckpt: null
+trainer:
+  _target_: algorithms.offline.OfflineTrainer
   epochs: 10000
-  global_batch_size: 128
+  max_train_steps: 100000
+  global_batch_size: 64
   global_seed: 0
   lr: 1e-4
   lr_schedule: cosine
-  lr_warmup_steps: 2000
-  min_lr: 3e-5
-  min_lr_ratio: 0.3
+  lr_warmup_steps: 3000
+  min_lr: 1e-5
+  weight_decay: 0.0
   grad_clip: 1.0
   ema_decay: 0.999
   log_every: 100
   ckpt_every: 10000
-  max_train_steps: 100000
-
-dataloader:
-  num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4
-  drop_last: true
-
-eval:
-  split: val
-  batch_size: 128
-  max_batches_per_dataset: 32
   dataloader:
-    num_workers: 2
+    num_workers: 8
     pin_memory: true
-    persistent_workers: false
-    prefetch_factor: 2
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    split: val
+    batch_size: 64
+    max_batches_per_dataset: 16
+    dataloader:
+      num_workers: 2
+      pin_memory: true
+      persistent_workers: false
+      prefetch_factor: 2
 
 wandb:
   project: DiT-qwen-clevr

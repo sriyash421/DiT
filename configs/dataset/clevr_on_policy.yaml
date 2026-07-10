@@ -1,0 +1,12 @@
+_target_: datasets.build_clevr_dataset
+datasets:
+  - name: base
+    path: /gscratch/scrubbed/sriyash/clevr_dit_dataset/data.zarr
+    sampling_ratio: 1.0
+    max_dataset_size: 50
+split: train
+image_size: ${model.image_size}
+use_disk: true
+load_meta: true
+load_images: true
+load_context: true

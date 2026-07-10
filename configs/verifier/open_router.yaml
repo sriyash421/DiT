@@ -1,0 +1,11 @@
+_target_: verifiers.open_router.OpenRouterVerifier
+api_key_env: OPENROUTER_API_KEY
+model: google/gemini-3.1-flash-lite
+temperature: 0.0
+max_tokens: 96
+retries: 2
+timeout: 120
+workers: 16
+include_caption: true
+include_metadata: false
+image_size: 256

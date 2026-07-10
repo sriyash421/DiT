@@ -1,62 +1,60 @@
+defaults:
+  - dataset: clevr_mixed_feedback
+  - _self_
+
 hydra:
   job:
     chdir: false
 
-data:
-  split: train
-  use_disk: true
-  load_meta: true
-  load_images: false
-  load_context: false
-  dataset_config:
-    - name: base
-      dataset_path: /gscratch/scrubbed/sriyash/clevr_dit_dataset_filtered/data.zarr
-      sampling_ratio: 0.75
-    - name: feedback
-      dataset_path: /gscratch/scrubbed/sriyash/vlm_feedback_dataset_l4_40k/data.zarr
-      sampling_ratio: 0.25
+ckpt: /gscratch/scrubbed/sriyash/DiT-qwen-clevr-base/base_l4/checkpoints/0100000-ema.pt
+results_dir: /gscratch/scrubbed/sriyash/DiT-qwen-clevr-adaptive
+experiment_name: adaptive_l4
 
 model:
+  _target_: models.qwen_dit.QwenDiT
   name: DiT-L/4
   image_size: 256
-  num_classes: 1001
   vae: stabilityai/sdxl-vae
   context_dropout_prob: 0.0
+  context_encoder:
+    freeze_encoder: true
+    model_id: Qwen/Qwen3.5-4B
+    dtype: bfloat16
+    max_length: 4096
+    lora_rank: 16
+    lora_alpha: 16
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 
-train:
-  results_dir: /gscratch/scrubbed/sriyash/DiT-step1
-  experiment_name: feedback_l4
-  ckpt: results/base_l4_lr1e-4_minlr1e-5_warmup5k_ema999_final2/checkpoints/0040000-ema.pt
+trainer:
+  _target_: algorithms.offline.OfflineTrainer
   epochs: 1000
+  max_train_steps: 50000
   global_batch_size: 128
   global_seed: 0
   lr: 2e-6
   lr_schedule: cosine
   lr_warmup_steps: 500
   min_lr: 2e-7
-  min_lr_ratio: 0.1
+  weight_decay: 0.0
   grad_clip: 1.0
   ema_decay: 0.9999
   log_every: 100
   ckpt_every: 1000
-  max_train_steps: 50000
-
-dataloader:
-  num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4
-  drop_last: true
-
-eval:
-  split: val
-  batch_size: 32
-  max_batches_per_dataset: 32
   dataloader:
-    num_workers: 4
+    num_workers: 8
     pin_memory: true
-    persistent_workers: false
-    prefetch_factor: 2
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    split: val
+    batch_size: 32
+    max_batches_per_dataset: 32
+    dataloader:
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: false
+      prefetch_factor: 2
 
 wandb:
   project: DiT-qwen-clevr
