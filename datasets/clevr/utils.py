@@ -1,5 +1,4 @@
-"""CLEVR caption rendering, transforms, metadata helpers, and zarr writers."""
-import json
+"""CLEVR caption rendering, transforms, and zarr writers."""
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -50,13 +49,21 @@ def adjacent_chain(labels, order, relation):
 
 
 def render_caption(row):
-    """Render the chain caption from a structured metadata row."""
+    """Render the chain caption from a structured metadata row.
+
+    Relation chains are empty for single-object scenes, so their sections are dropped.
+    """
     objects = row["objects"]
     labels = unique_labels(objects)
     object_list = ", ".join(full_description(obj) for obj in objects)
     horizontal = adjacent_chain(labels, row["orders"]["left_to_right"], "right of")
     depth = adjacent_chain(labels, row["orders"]["front_to_back"], "behind")
-    return f"objects: {object_list}. horizontal: {horizontal}. depth: {depth}."
+    parts = [f"objects: {object_list}."]
+    if horizontal:
+        parts.append(f"horizontal: {horizontal}.")
+    if depth:
+        parts.append(f"depth: {depth}.")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -72,19 +79,14 @@ def build_clevr_transform(image_size):
 
 
 def resize_square_array(path, image_size):
-    """Center-crop an image file to a square and resize; returns a uint8 array."""
+    """Resize an image file to a square; returns a uint8 array."""
     image = Image.open(path).convert("RGB")
-    w, h = image.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    image = image.crop((left, top, left + side, top + side))
     image = image.resize((image_size, image_size), Image.Resampling.BICUBIC)
     return np.asarray(image, dtype=np.uint8)
 
 
 # ---------------------------------------------------------------------------
-# Metadata helpers.
+# Path helpers.
 # ---------------------------------------------------------------------------
 
 def resolve_path(root, path):
@@ -97,91 +99,10 @@ def resolve_path(root, path):
     return path
 
 
-def load_metadata_rows(dataset_root):
-    """Load metadata.jsonl from a dataset root; returns (rows, rows by image_path)."""
-    path = Path(dataset_root) / "metadata.jsonl"
-    if not path.exists():
-        return [], {}
-    rows = []
-    with path.open() as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    return rows, {row["image_path"]: row for row in rows}
-
-
-def load_metadata_for_zarr(dataset_path):
-    """Load the metadata.jsonl that sits next to a data.zarr store."""
-    path = Path(dataset_path)
-    candidates = []
-    if path.name == "data.zarr":
-        candidates.append(path.parent / "metadata.jsonl")
-    candidates.append(path / "metadata.jsonl")
-    for candidate in candidates:
-        if candidate.exists():
-            rows = []
-            with candidate.open() as f:
-                for line in f:
-                    if line.strip():
-                        rows.append(json.loads(line))
-            return rows
-    return []
-
-
-def metadata_by_index(metadata_rows, metadata_indices):
-    out = []
-    for idx in metadata_indices:
-        idx = int(idx)
-        out.append(metadata_rows[idx] if 0 <= idx < len(metadata_rows) else None)
-    return out
-
-
-def metadata_for_row(row, metadata_rows, metadata_by_image_path):
-    if row.get("metadata") is not None:
-        return row["metadata"]
-    idx = row.get("metadata_index")
-    if isinstance(idx, int) and 0 <= idx < len(metadata_rows):
-        return metadata_rows[idx]
-    return metadata_by_image_path.get(row.get("image_path") or row.get("source_image_path"))
-
-
-def compact_metadata_text(metadata):
-    if metadata is None:
-        return None
-    objects = metadata.get("objects", [])
-    object_lines = []
-    for obj in objects:
-        object_lines.append(
-            f"id {obj.get('id')}: {obj.get('size')} {obj.get('color')} "
-            f"{obj.get('material')} {obj.get('shape')} ({obj.get('label')})"
-        )
-    orders = metadata.get("orders", {})
-
-    def order_text(key):
-        labels = []
-        for idx in orders.get(key, []):
-            match = next((obj for obj in objects if obj.get("id") == idx), None)
-            labels.append(match.get("label", str(idx)) if match else str(idx))
-        return ", ".join(labels)
-
-    return "\n".join([
-        "Objects:",
-        *object_lines,
-        f"Left-to-right order: {order_text('left_to_right')}",
-        f"Front-to-back order: {order_text('front_to_back')}",
-    ])
-
-
-def build_context_text(caption, metadata=None, feedback=None, include_metadata=False):
-    parts = []
-    if caption:
-        parts.append(f"Caption: {caption}")
-    meta_text = compact_metadata_text(metadata) if include_metadata else None
-    if meta_text:
-        parts.append(f"CLEVR metadata:\n{meta_text}")
-    if feedback:
-        parts.append(f"Feedback: {feedback}")
-    return "\n\n".join(parts)
+def zarr_has_context(path):
+    """True when a stage-2 zarr already carries stage-3 context tokens."""
+    root = zarr.open(str(path), mode="r")
+    return "context_offsets" in root["data"]
 
 
 # ---------------------------------------------------------------------------

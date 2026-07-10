@@ -19,7 +19,7 @@ model:
   image_height: 256
   image_width: 256
   vae: null
-  lora_finetune: true
+  lora_finetune: false
   lora_rank: 128
   lora_alpha: 128
   lora_init: gaussian

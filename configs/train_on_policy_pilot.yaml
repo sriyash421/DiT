@@ -16,9 +16,6 @@ verifier:
   api_url: http://g3128:8000/v1
 
 trainer:
-  context_encoder:
-    max_length: 4096
-    include_metadata: false
   val_dataset:
     split: train
   rollout:

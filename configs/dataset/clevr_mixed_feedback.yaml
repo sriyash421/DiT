@@ -13,4 +13,4 @@ image_size: ${model.image_size}
 use_disk: true
 load_meta: true
 load_images: false
-load_context: false
+load_context: true

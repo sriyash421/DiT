@@ -7,9 +7,7 @@ which must never be imported: it pulls in HuggingFace `datasets`, which this rep
 import os
 import random
 
-import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -131,13 +129,7 @@ class OmniClevrDataset(Dataset):
         }
 
     def __getitem__(self, idx):
-        for _ in range(8):
-            try:
-                return self._make_example(int(idx))
-            except Exception as exc:
-                print(f"error when loading OmniGen CLEVR row {idx}: {exc}")
-                idx = random.randint(0, len(self) - 1)
-        raise RuntimeError("Too many bad OmniGen CLEVR rows.")
+        return self._make_example(int(idx))
 
 
 class OmniClevrCollator:
@@ -317,7 +309,7 @@ class OmniGenModel:
     def ddp(self, device):
         from torch.nn.parallel import DistributedDataParallel as DDP
 
-        self.net = DDP(self.net, device_ids=[device], find_unused_parameters=False)
+        self.net = DDP(self.net, device_ids=[device], find_unused_parameters=True)
 
     def trainable_parameters(self):
         return [p for p in self.net.parameters() if p.requires_grad]

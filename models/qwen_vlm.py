@@ -39,26 +39,12 @@ def load_vlm(model_id, device, dtype="bfloat16", device_map=None):
     raise RuntimeError("Could not load VLM model. Tried:\n" + "\n".join(errors))
 
 
-def build_messages(texts, images=None):
-    images = images or [None] * len(texts)
-    messages = []
-    for text, image in zip(texts, images):
-        content = []
-        if isinstance(image, (list, tuple)):
-            for item in image:
-                if item is not None:
-                    content.append({"type": "image", "image": item.convert("RGB")})
-        elif image is not None:
-            content.append({"type": "image", "image": image.convert("RGB")})
-        content.append({"type": "text", "text": text})
-        messages.append([{"role": "user", "content": content}])
-    return messages
-
-
 def build_history_messages(captions, feedback_histories, image_histories):
     """One message per row in causal order: caption, then attempt image 0, feedback 0, image 1, feedback 1, ..."""
+    assert len(captions) == len(feedback_histories) == len(image_histories)
     messages = []
     for caption, feedbacks, images in zip(captions, feedback_histories, image_histories):
+        assert len(feedbacks) == len(images)
         content = [{"type": "text", "text": f"Caption: {caption}"}]
         for idx, (image, feedback) in enumerate(zip(images, feedbacks)):
             content.append({"type": "image", "image": image.convert("RGB")})
@@ -96,7 +82,8 @@ def processor_inputs(processor, messages):
 
 
 class QwenEncoder:
-    """Encodes caption texts into context tokens. Frozen by default; LoRA-finetuned when freeze=False."""
+    """Encodes caption + feedback/attempt histories into context tokens.
+    Frozen by default; LoRA-finetuned when freeze=False."""
 
     def __init__(
         self,
@@ -108,10 +95,11 @@ class QwenEncoder:
         lora_rank=16,
         lora_alpha=16,
         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+        device_map=None,
     ):
         self.freeze = bool(freeze)
         self.max_length = int(max_length)
-        self.processor, self.model = load_vlm(model_id, device, dtype=dtype)
+        self.processor, self.model = load_vlm(model_id, device, dtype=dtype, device_map=device_map)
         if not self.freeze:
             from peft import LoraConfig, get_peft_model
 
@@ -125,13 +113,13 @@ class QwenEncoder:
         base = self.model.base_model.model if hasattr(self.model, "base_model") else self.model
         self.hidden_size = base.config.text_config.hidden_size
 
-    def encode(self, texts, images):
-        """Encode texts with their attempt images into (tokens, mask); gradients flow when not frozen.
+    def train(self):
+        if not self.freeze:
+            self.model.train()
 
-        images has one entry per text: the generated attempt image(s) for feedback rows,
-        None for caption-only rows.
-        """
-        return self._encode_messages(build_messages(texts, images))
+    def eval(self):
+        if not self.freeze:
+            self.model.eval()
 
     def encode_history(self, captions, feedback_histories, attempt_image_histories):
         """Encode interleaved history rows: caption, then each attempt image followed by its feedback."""
@@ -141,6 +129,12 @@ class QwenEncoder:
         module = self.model.module if hasattr(self.model, "module") else self.model
         inputs = processor_inputs(self.processor, messages)
         if inputs["input_ids"].shape[1] > self.max_length:
+            if "pixel_values" in inputs or "image_grid_thw" in inputs:
+                raise ValueError(
+                    f"Context of {inputs['input_ids'].shape[1]} tokens exceeds max_length={self.max_length} "
+                    "and contains images; truncating would cut image placeholder tokens. "
+                    "Shorten the history or raise max_length."
+                )
             for key in ("input_ids", "attention_mask"):
                 inputs[key] = inputs[key][:, :self.max_length]
         model_device = next(module.parameters()).device
@@ -151,30 +145,3 @@ class QwenEncoder:
         mask = inputs["attention_mask"].bool()
         hidden = hidden * mask.unsqueeze(-1).to(hidden.dtype)
         return hidden, mask
-
-
-@torch.no_grad()
-def encode_contexts(processor, model, texts, device, images=None, max_length=None, out_dtype=torch.float16):
-    """Encode texts (and optional images) with the frozen VLM; returns (hidden states, attention mask) on CPU."""
-    return encode_messages(processor, model, build_messages(texts, images), max_length=max_length, out_dtype=out_dtype)
-
-
-@torch.no_grad()
-def encode_messages(processor, model, messages, max_length=None, out_dtype=torch.float16):
-    """Encode prebuilt chat messages with the frozen VLM; returns (hidden states, attention mask) on CPU."""
-    inputs = processor_inputs(processor, messages)
-    if max_length is not None and "input_ids" in inputs and inputs["input_ids"].shape[1] > max_length:
-        for key in ("input_ids", "attention_mask"):
-            if key in inputs:
-                inputs[key] = inputs[key][:, :max_length]
-    model_device = next(model.parameters()).device
-    inputs = {key: value.to(model_device) if hasattr(value, "to") else value for key, value in inputs.items()}
-    outputs = model(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
-    hidden = outputs.hidden_states[-1]
-    mask = inputs.get("attention_mask")
-    if mask is None:
-        mask = torch.ones(hidden.shape[:2], device=hidden.device, dtype=torch.bool)
-    else:
-        mask = mask.bool()
-    hidden = hidden * mask.unsqueeze(-1).to(hidden.dtype)
-    return hidden.detach().cpu().to(out_dtype), mask.detach().cpu()

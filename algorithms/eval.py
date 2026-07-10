@@ -74,6 +74,9 @@ def run_checkpoint_eval(model, eval_datasets, eval_names, eval_cfg, device, logg
     net = model.net
     was_training = net.training
     net.eval()
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None:
+        encoder.eval()
     metrics = {}
     for name, eval_dataset in zip(eval_names, eval_datasets):
         wrapped, collate = model.prepare_dataset(eval_dataset)
@@ -86,10 +89,12 @@ def run_checkpoint_eval(model, eval_datasets, eval_names, eval_cfg, device, logg
         logger.info("Eval losses: " + ", ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
     if was_training:
         net.train()
+        if encoder is not None:
+            encoder.train()
 
 
 def select_eval_batch(dataset, seed, count):
-    """Randomly pick rows and return their contexts, captions, GT images, and metadata indices.
+    """Randomly pick rows and return their contexts, captions, and GT images.
 
     Works on both ClevrContextDataset and ClevrContextMultiDataset.
     """
@@ -100,14 +105,12 @@ def select_eval_batch(dataset, seed, count):
     contexts = []
     captions = []
     gt_images = []
-    metadata_indices = []
     for idx in indices:
         item = dataset[idx]
         if dataset.context_dim is not None:
             contexts.append(item["context_tokens"].float())
         captions.append(item["caption"])
         gt_images.append(dataset.image_for_index(idx).convert("RGB"))
-        metadata_indices.append(item["metadata_index"])
     if contexts:
         context_tokens, context_mask = pad_contexts(contexts)
     else:
@@ -118,14 +121,14 @@ def select_eval_batch(dataset, seed, count):
         "context_mask": context_mask,
         "caption": captions,
         "gt_images": gt_images,
-        "metadata_index": torch.tensor(metadata_indices, dtype=torch.long),
     }
 
 
 @torch.no_grad()
-def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, metadata, gt_images, steps, seed, scorer):
+def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, gt_images, steps, seed, scorer):
     """Iteratively sample, score against GT, and refine with verifier feedback.
 
+    Makes `steps` predictions and asks for feedback only steps-1 times.
     Returns (traces, histories, token_count): per-item lists of {image, feedback_used, distance} steps,
     the feedback given to each item, and the verifier tokens spent.
     """
@@ -144,9 +147,8 @@ def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, metada
             break
         _, attempt_images = sampler.sample(net, vae, current_tokens, current_mask, device, seed=seed + step)
         active_captions = [batch["caption"][idx] for idx in active]
-        active_metadata = [metadata[idx] for idx in active]
         active_gt_images = [gt_images[idx] for idx in active]
-        score_results = scorer.score_distance_batch(active_captions, active_metadata, active_gt_images, attempt_images)
+        score_results = scorer.score_distance(active_captions, active_gt_images, attempt_images)
         token_count += sum(int(result.token_count) for result in score_results)
         for pos, batch_idx in enumerate(active):
             distance = None
@@ -161,9 +163,8 @@ def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, metada
         if step + 1 >= steps:
             break
         active_histories = [list(histories[idx]) for idx in active]
-        results = verifier.verify_history_batch(
+        results = verifier.verify(
             active_captions,
-            active_metadata,
             active_gt_images,
             attempt_images,
             active_histories,

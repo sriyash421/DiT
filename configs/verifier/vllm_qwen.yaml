@@ -8,6 +8,4 @@ retries: 2
 timeout: 180
 workers: 64
 enable_thinking: false
-include_caption: true
-include_metadata: false
 image_size: 256

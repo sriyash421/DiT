@@ -6,6 +6,4 @@ max_tokens: 96
 retries: 2
 timeout: 120
 workers: 16
-include_caption: true
-include_metadata: false
 image_size: 256

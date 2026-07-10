@@ -14,8 +14,6 @@ class VLLMQwenVerifier(OpenAIChatVerifier):
         timeout=120,
         workers=8,
         enable_thinking=False,
-        include_caption=True,
-        include_metadata=False,
         image_size=None,
     ):
         super().__init__(
@@ -28,8 +26,6 @@ class VLLMQwenVerifier(OpenAIChatVerifier):
             timeout=timeout,
             workers=workers,
             enable_thinking=enable_thinking,
-            include_caption=include_caption,
-            include_metadata=include_metadata,
             image_size=image_size,
             extra_payload={"chat_template_kwargs": {"enable_thinking": bool(enable_thinking)}},
         )

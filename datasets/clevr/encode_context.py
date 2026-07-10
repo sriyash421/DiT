@@ -1,5 +1,8 @@
 """Stage 3: encode captions (plus feedback and generated images) with a frozen Qwen VLM
 and append the context tokens to an existing data.zarr store.
+
+Contexts use the single interleaved history format: base rows are caption-only (empty
+history), feedback rows are 1-step histories (caption, generated image, feedback).
 """
 import argparse
 
@@ -9,62 +12,97 @@ import zarr
 from PIL import Image
 from tqdm import tqdm
 
-from datasets.clevr.utils import ContextTokenWriter, build_context_text, load_metadata_for_zarr
-from models.qwen_vlm import encode_contexts, load_vlm
+from datasets.clevr.utils import ContextTokenWriter
 
 
-def main(args):
-    root = zarr.open(args.zarr, mode="r")
+def encode_context_tokens(
+    zarr_path,
+    vlm_model,
+    device,
+    *,
+    batch_size=4,
+    max_context_len=1024,
+    dtype="float16",
+    vlm_dtype="bfloat16",
+    overwrite=False,
+    device_map=None,
+):
+    """Append frozen-VLM context tokens to a stage-2 zarr; returns the writer stats."""
+    from models.qwen_vlm import QwenEncoder
+
+    root = zarr.open(str(zarr_path), mode="r")
     meta = root["meta"]
     data = root["data"]
     captions = meta["caption"][:]
     feedbacks = meta["feedback"][:]
-    metadata_indices = meta["metadata_index"][:]
     generated_image_indices = data["generated_image_index"][:]
     num_rows = len(captions)
-    metadata_rows = load_metadata_for_zarr(args.zarr)
 
-    device = torch.device(args.device)
-    out_dtype = getattr(torch, args.dtype)
-    processor, vlm = load_vlm(args.vlm_model, device, dtype=args.vlm_dtype, device_map=args.device_map)
+    device = torch.device(device)
+    out_dtype = getattr(torch, dtype)
+    encoder = QwenEncoder(
+        model_id=vlm_model,
+        device=device,
+        dtype=vlm_dtype,
+        max_length=max_context_len,
+        freeze=True,
+        device_map=device_map,
+    )
 
     writer = None
-    for start in tqdm(range(0, num_rows, args.batch_size), desc="encode context", unit="batch"):
-        row_indices = range(start, min(start + args.batch_size, num_rows))
-        texts = []
-        images = []
+    for start in tqdm(range(0, num_rows, batch_size), desc="encode context", unit="batch"):
+        row_indices = range(start, min(start + batch_size, num_rows))
+        batch_captions = []
+        feedback_histories = []
+        image_histories = []
         for row_idx in row_indices:
-            metadata_index = int(metadata_indices[row_idx])
-            metadata = metadata_rows[metadata_index] if 0 <= metadata_index < len(metadata_rows) else None
-            texts.append(build_context_text(str(captions[row_idx]), metadata, str(feedbacks[row_idx]) or None))
+            feedback = str(feedbacks[row_idx])
             generated_idx = int(generated_image_indices[row_idx])
-            if generated_idx >= 0:
-                images.append(Image.fromarray(np.asarray(data["generated_images"][generated_idx]), mode="RGB"))
+            assert bool(feedback) == (generated_idx >= 0), (
+                f"Row {row_idx}: feedback rows must carry a generated image and base rows must not."
+            )
+            batch_captions.append(str(captions[row_idx]))
+            if feedback:
+                image = Image.fromarray(np.asarray(data["generated_images"][generated_idx]), mode="RGB")
+                feedback_histories.append([feedback])
+                image_histories.append([image])
             else:
-                images.append(None)
+                feedback_histories.append([])
+                image_histories.append([])
 
-        tokens, masks = encode_contexts(
-            processor,
-            vlm,
-            texts,
-            device,
-            images=images,
-            max_length=args.max_context_len,
-            out_dtype=out_dtype,
-        )
-        valid_tokens = [token[mask.bool()].contiguous() for token, mask in zip(tokens, masks)]
+        tokens, masks = encoder.encode_history(batch_captions, feedback_histories, image_histories)
+        tokens = tokens.detach().cpu().to(out_dtype)
+        masks = masks.detach().cpu()
+        valid_tokens = [token[mask].contiguous() for token, mask in zip(tokens, masks)]
         if writer is None:
             writer = ContextTokenWriter(
-                zarr_path=args.zarr,
-                vlm_model=args.vlm_model,
+                zarr_path=zarr_path,
+                vlm_model=vlm_model,
                 context_dim=int(valid_tokens[0].shape[-1]),
-                max_context_len=args.max_context_len,
-                dtype=args.dtype,
-                overwrite=args.overwrite,
+                max_context_len=max_context_len,
+                dtype=dtype,
+                overwrite=overwrite,
             )
         writer.append_batch(valid_tokens)
 
-    stats = writer.stats()
+    del encoder
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return writer.stats()
+
+
+def main(args):
+    stats = encode_context_tokens(
+        args.zarr,
+        args.vlm_model,
+        args.device,
+        batch_size=args.batch_size,
+        max_context_len=args.max_context_len,
+        dtype=args.dtype,
+        vlm_dtype=args.vlm_dtype,
+        overwrite=args.overwrite,
+        device_map=args.device_map,
+    )
     lengths = stats["token_lengths"]
     print(f"Encoded {stats['rows']} rows into {args.zarr} (context_dim={stats['context_dim']})")
     print(

@@ -1,4 +1,4 @@
-"""Stage 1: filter raw CLEVR scenes by object count and render the chain caption per image.
+"""Stage 1: keep raw CLEVR scenes with at most --max-objects objects and render the chain caption per image.
 
 Writes images/ (symlinks or copies) and metadata.jsonl into the output directory.
 """
@@ -65,7 +65,7 @@ def main(args):
         with scene_path.open() as f:
             scenes = json.load(f)["scenes"]
         for scene in tqdm(scenes, desc=f"filter {split}", unit="scene"):
-            if len(scene["objects"]) != args.num_objects:
+            if len(scene["objects"]) > args.max_objects:
                 continue
             image_path = Path("images") / split / scene["image_filename"]
             link_or_copy(clevr_root / "images" / split / scene["image_filename"], out / image_path, args.copy_images)
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--clevr-root", type=str, required=True)
     parser.add_argument("--out", type=str, required=True)
-    parser.add_argument("--num-objects", type=int, default=3)
+    parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--splits", nargs="+", default=["train", "val"])
     parser.add_argument("--copy-images", action="store_true", help="Copy images instead of creating symlinks.")
     main(parser.parse_args())

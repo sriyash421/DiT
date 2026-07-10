@@ -50,16 +50,24 @@ API keys come from environment variables: `GEMINI_API_KEY` (native Gemini verifi
 
 ## Data
 
+Download raw CLEVR first:
+
+```bash
+wget https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip && unzip CLEVR_v1.0.zip
+```
+
 Three stages turn raw CLEVR into a training-ready zarr (details in `datasets/clevr/README.md`):
 
 ```bash
-python -m datasets.clevr.preprocess_clevr --clevr-root <CLEVR_v1.0> --out <dataset_dir> --num-objects 3
+python -m datasets.clevr.preprocess_clevr --clevr-root CLEVR_v1.0 --out <dataset_dir> --max-objects 3
 python -m datasets.clevr.convert_to_zarr --dataset <dataset_dir>
 python -m datasets.clevr.encode_context --zarr <dataset_dir>/data.zarr
 ```
 
-Captions use the single `chain` template. Stage 3 (frozen-Qwen context tokens) is optional if you train
-with `model.context_encoder.freeze_encoder: false`, but precomputing is much faster for a frozen encoder.
+Captions use the single `chain` template; stage 1 keeps every scene with at most `--max-objects`
+objects. Stage 3 (frozen-Qwen context tokens) is only consumed by frozen-encoder offline training
+(`train_adaptive`) and runs automatically at training startup when the zarr lacks tokens; running
+it up front just moves the cost. On-policy training and the evals encode contexts on the fly.
 
 ## Training
 
@@ -77,10 +85,13 @@ torchrun --nproc_per_node=1 train.py --config-name train_on_policy   # on-policy
 - Set `model.context_encoder.freeze_encoder: false` to LoRA-finetune the Qwen context encoder end-to-end;
   set `model.lora_finetune: false` in `train_omni` for full OmniGen finetuning.
 
-The on-policy loop: sample attempts from the EMA policy, verify each against the GT with the configured
-verifier (`configs/verifier/`), re-encode caption+feedback history with the frozen Qwen encoder, and run
-`updates_per_rollout` diffusion updates on the accepted records. Step-0 records train caption-only
-conditioning; later steps train feedback conditioning (`rollout.length` controls depth).
+The on-policy loop: sample attempts from the EMA policy, verify against the GT with the configured
+verifier (`configs/verifier/`), encode the interleaved caption/attempt/feedback history with the Qwen
+encoder, and run `updates_per_rollout` diffusion updates on the accepted records. `rollout.length` is
+the number of predictions per rollout: length K makes K predictions and asks for feedback K-1 times
+(feedback on the final attempt would never be used). A depth-k record trains on the history that
+generated attempt k — caption-only at depth 0, caption + k feedback/attempt pairs after that.
+On-policy launches also need `OPENROUTER_API_KEY` for the hardcoded eval distance scorer.
 
 ## Evaluation
 
@@ -102,4 +113,4 @@ pytest test.py -q                          # + integration (CUDA, GEMINI_API_KEY
 ## Cluster
 
 `job_*.sh` are the slurm launchers (train, on-policy, feedback generation, evals, and the vLLM server
-used by the `vllm_qwen` verifier). See `NOTES.md` for the post-refactor review list.
+used by the `vllm_qwen` verifier). See `NOTES.md` for remaining oddities and intentional decisions.

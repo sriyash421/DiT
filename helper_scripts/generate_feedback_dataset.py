@@ -176,8 +176,6 @@ def build_dataset_verifier(args, device):
             max_tokens=args.max_new_tokens,
             retries=args.retries,
             workers=args.vlm_workers,
-            include_caption=args.use_caption,
-            include_metadata=False,
             image_size=args.image_size,
         )
     if args.vlm == "qwen-vllm":
@@ -191,8 +189,6 @@ def build_dataset_verifier(args, device):
             retries=args.retries,
             workers=args.vlm_workers,
             enable_thinking=args.enable_thinking,
-            include_caption=args.use_caption,
-            include_metadata=False,
             image_size=args.image_size,
         )
     if args.vlm == "qwen-local":
@@ -206,8 +202,6 @@ def build_dataset_verifier(args, device):
             max_tokens=args.max_new_tokens,
             workers=args.vlm_batch_size,
             enable_thinking=args.enable_thinking,
-            include_caption=args.use_caption,
-            include_metadata=False,
             image_size=args.image_size,
         )
     raise ValueError(args.vlm)
@@ -226,7 +220,6 @@ def build_output_row(args, task, feedback, token_usage):
         "tuple_id": tuple_id(task),
         "metadata_index": task["metadata_index"],
         "caption": task["caption"],
-        "metadata": task["metadata"],
         "gt_image_path": task["gt_image_path"],
         "generated_image_path": task["generated_image_path"],
         "source_image_path": task["source_image_path"],
@@ -252,9 +245,8 @@ def run_feedback(args, tasks, jsonl_path, failures_path, device):
             )
             for task in batch
         ]
-        results = verifier.verify_batch(
+        results = verifier.verify(
             [task["caption"] for task in batch],
-            [task["metadata"] for task in batch],
             [pair[0] for pair in image_pairs],
             [pair[1] for pair in image_pairs],
         )
@@ -263,7 +255,7 @@ def run_feedback(args, tasks, jsonl_path, failures_path, device):
             if result.ok:
                 append_jsonl(jsonl_path, build_output_row(args, row_task, result.feedback, result.token_usage or {}))
             else:
-                append_jsonl(failures_path, {**row_task, "metadata": None, "error": result.error, "vlm": args.vlm})
+                append_jsonl(failures_path, {**row_task, "error": result.error, "vlm": args.vlm})
 
 
 def main():
@@ -288,7 +280,6 @@ def main():
     parser.add_argument("--vlm", choices=["gemini", "qwen-local", "qwen-vllm"], default="gemini")
     parser.add_argument("--vlm-temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--use-caption", action="store_true")
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--vlm-workers", type=int, default=8)
     parser.add_argument("--vlm-batch-size", type=int, default=8)
@@ -312,7 +303,6 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     index = load_index(args.dataset_root)
-    metadata_rows = load_jsonl(Path(args.dataset_root).parent / "metadata.jsonl") if (Path(args.dataset_root).parent / "metadata.jsonl").exists() else []
     caption_records = select_caption_records(index, args.split, args.max_images)
     if not caption_records:
         raise RuntimeError("No caption records selected")
@@ -322,10 +312,8 @@ def main():
 
     feedback_tasks = []
     for gen_task in generation_tasks:
-        metadata_index = gen_task["metadata_index"]
-        metadata = metadata_rows[metadata_index] if 0 <= metadata_index < len(metadata_rows) else None
         for feedback_index in range(args.feedbacks_per_image):
-            feedback_tasks.append({**gen_task, "feedback_index": feedback_index, "metadata": metadata})
+            feedback_tasks.append({**gen_task, "feedback_index": feedback_index})
     completed_keys = {tuple_key(row) for row in load_jsonl(jsonl_path)} if jsonl_path.exists() else set()
     pending = [task for task in feedback_tasks if tuple_key(task) not in completed_keys]
     print(f"Captions: {len(caption_records)}, generated: {len(generation_tasks)}, "

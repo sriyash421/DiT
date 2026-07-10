@@ -68,7 +68,7 @@ def main(cfg):
     model = hydra.utils.instantiate(cfg.model, context_dim=dataset.context_dim, device=device)
     model.load(cfg.ckpt, use_ema=cfg.use_ema)
     model.net.eval()
-    scorer = make_scorer(**cfg.scorer)
+    scorer = make_scorer()
 
     metrics = {}
     grids = {}

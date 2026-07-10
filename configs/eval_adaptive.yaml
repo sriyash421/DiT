@@ -17,15 +17,14 @@ model:
   image_size: 256
   vae: stabilityai/sdxl-vae
   context_dropout_prob: 0.0
-
-context_encoder:
-  _target_: algorithms.on_policy.QwenContextEncoder
-  model_id: Qwen/Qwen3.5-4B
-  device: cuda
-  vlm_dtype: bfloat16
-  device_map: null
-  max_length: 4096
-  include_metadata: false
+  context_encoder:
+    freeze_encoder: true
+    model_id: Qwen/Qwen3.5-4B
+    dtype: bfloat16
+    max_length: 4096
+    lora_rank: 16
+    lora_alpha: 16
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 split: val
 num_captions: 8
@@ -37,10 +36,6 @@ sampling:
   num_sampling_steps: 50
   cfg_scale: 1.0
   ddim_eta: 0.0
-
-scorer:
-  workers: 16
-  max_tokens: 16
 
 wandb:
   project: DiT-qwen-clevr

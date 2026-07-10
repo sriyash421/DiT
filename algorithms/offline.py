@@ -156,10 +156,6 @@ class OfflineTrainer:
                     avg_grad = values[1].item() / (log_steps * self.world_size)
                     avg_lr = values[2].item() / (log_steps * self.world_size)
                     source_fracs = (source_counts / max(values[3].item(), 1)).cpu().tolist()
-                    self.logger.info(
-                        f"(step={self.train_steps:07d}) Loss: {avg_loss:.4f}, "
-                        f"Grad Norm: {avg_grad:.4f}, LR: {avg_lr:.6g}, Steps/Sec: {steps_per_sec:.2f}"
-                    )
                     if rank_is_zero():
                         payload = {
                             "train/loss": avg_loss,

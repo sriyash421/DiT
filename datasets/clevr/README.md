@@ -2,16 +2,23 @@
 
 Three stages turn raw CLEVR into a training-ready `data.zarr`. All commands run from the repo root.
 
+Download raw CLEVR first:
+
+```bash
+wget https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip && unzip CLEVR_v1.0.zip
+```
+
 ## Stage 1 — filter and caption
 
-Filters scenes by object count, symlinks the images, and renders the single **chain** caption per image
-(`objects: ... horizontal: ... depth: ...`). Writes `images/` and `metadata.jsonl`.
+Keeps every scene with at most `--max-objects` objects, symlinks the images, and renders the single
+**chain** caption per image (`objects: ... horizontal: ... depth: ...`; the `horizontal`/`depth`
+sections are dropped for single-object scenes). Writes `images/` and `metadata.jsonl`.
 
 ```bash
 python -m datasets.clevr.preprocess_clevr \
-    --clevr-root /path/to/CLEVR_v1.0 \
+    --clevr-root CLEVR_v1.0 \
     --out /path/to/clevr_dit_dataset \
-    --num-objects 3 --splits train val
+    --max-objects 3 --splits train val
 ```
 
 ## Stage 2 — convert to zarr
@@ -27,8 +34,11 @@ use `--mode feedback`, which additionally stores the generated attempt images.
 
 ## Stage 3 — encode context tokens
 
-Encodes each row's caption (+ feedback and generated image for feedback rows) with a frozen Qwen VLM
-and appends the token arrays to the same zarr. Needs a GPU.
+Encodes each row with a frozen Qwen VLM in the single interleaved history format — base rows are
+caption-only, feedback rows are `caption, generated image, feedback` — and appends the token arrays
+to the same zarr. Needs a GPU. Only frozen-encoder offline training consumes these tokens, and
+`train.py` runs this stage automatically at startup when the zarr lacks them; the CLI just lets you
+pay the cost up front.
 
 ```bash
 python -m datasets.clevr.encode_context --zarr /path/to/clevr_dit_dataset/data.zarr --batch-size 4
@@ -57,4 +67,4 @@ is the config-facing factory that mixes multiple stores with sampling ratios.
 ## Other files here
 
 - `dataset.py` — dataset classes, `DistributedWeightedSampler`, `context_collate`.
-- `utils.py` — chain caption rendering, transforms, metadata helpers, zarr writers.
+- `utils.py` — chain caption rendering, transforms, zarr writers.

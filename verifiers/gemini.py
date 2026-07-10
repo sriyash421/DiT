@@ -26,8 +26,6 @@ class GeminiVerifier(FeedbackVerifier):
         retries=2,
         timeout=120,
         workers=8,
-        include_caption=False,
-        include_metadata=False,
     ):
         self.api_key = os.environ[api_key_env]
         self.model = model
@@ -37,10 +35,8 @@ class GeminiVerifier(FeedbackVerifier):
         self.retries = int(retries)
         self.timeout = int(timeout)
         self.workers = int(workers)
-        self.include_caption = bool(include_caption)
-        self.include_metadata = bool(include_metadata)
 
-    def verify_one(self, caption, metadata, gt_image, attempt_image):
+    def _verify_row(self, caption, gt_image, attempt_image, feedback_history):
         import requests
 
         headers = {"Content-Type": "application/json"}
@@ -50,14 +46,7 @@ class GeminiVerifier(FeedbackVerifier):
             "contents": [{
                 "role": "user",
                 "parts": [
-                    {
-                        "text": build_feedback_prompt(
-                            caption=caption,
-                            metadata=metadata,
-                            include_caption=self.include_caption,
-                            include_metadata=self.include_metadata,
-                        )
-                    },
+                    {"text": build_feedback_prompt(caption, feedback_history=feedback_history)},
                     {"text": "Ground-truth image:"},
                     {"inline_data": {"mime_type": "image/png", "data": pil_to_png_base64(gt_image)}},
                     {"text": "Generated image:"},

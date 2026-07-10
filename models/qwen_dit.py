@@ -3,7 +3,6 @@ import math
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models import AutoencoderKL
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
@@ -225,7 +224,6 @@ class DiT(nn.Module):
         return context_tokens, context_mask
 
     def adapt_context(self, context_tokens, context_mask):
-        # context_tokens = self.context_adapter(context_tokens)
         mask = context_mask.to(device=context_tokens.device, dtype=context_tokens.dtype)
         denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
         pooled_context = (context_tokens * mask.unsqueeze(-1)).sum(dim=1) / denom
@@ -308,35 +306,28 @@ class QwenDiT:
     """Qwen-conditioned DiT with its frozen VAE, training diffusion, and optional context encoder."""
 
     def __init__(self, name, image_size, context_dim, context_dropout_prob, vae, device, context_encoder=None):
-        from models.qwen_vlm import QwenEncoder
-
         self.name = name
         self.image_size = int(image_size)
         self.latent_size = self.image_size // 8
         self.device = device
+        self.encoder_cfg = context_encoder
 
+        # The encoder is a trainable component only when not frozen; a frozen encoder is
+        # built lazily via ensure_encoder() by the consumers that actually encode.
         self.encoder = None
-        if context_encoder is not None and (not context_encoder.freeze_encoder or context_dim is None):
-            self.encoder = QwenEncoder(
-                model_id=context_encoder.model_id,
-                device=device,
-                dtype=context_encoder.dtype,
-                max_length=context_encoder.max_length,
-                freeze=context_encoder.freeze_encoder,
-                lora_rank=context_encoder.lora_rank,
-                lora_alpha=context_encoder.lora_alpha,
-                lora_target_modules=context_encoder.lora_target_modules,
-            )
-            if context_encoder.freeze_encoder and (not dist.is_initialized() or dist.get_rank() == 0):
-                print(
-                    "Context encoder is frozen but the dataset has no precomputed context tokens; "
-                    "run datasets/clevr/encode_context.py on the zarr to speed up training."
-                )
-            if context_dim is None:
-                print(dir(self.encoder))
-                context_dim = self.encoder.hidden_size
+        if context_encoder is not None and not context_encoder.freeze_encoder:
+            self.encoder = self._build_encoder()
+
         if context_dim is None:
-            raise ValueError("Dataset has no precomputed context tokens; set model.context_encoder.")
+            if self.encoder is not None:
+                context_dim = self.encoder.hidden_size
+            elif context_encoder is not None:
+                from transformers import AutoConfig
+
+                config = AutoConfig.from_pretrained(context_encoder.model_id, trust_remote_code=True)
+                context_dim = config.text_config.hidden_size
+            else:
+                raise ValueError("Dataset has no precomputed context tokens; set model.context_encoder.")
 
         self.context_dim = int(context_dim)
         self.net = DiT_models[name](
@@ -347,14 +338,35 @@ class QwenDiT:
         self.vae = AutoencoderKL.from_pretrained(vae).to(device).eval()
         self.diffusion = create_diffusion(timestep_respacing="")
 
+    def _build_encoder(self):
+        from models.qwen_vlm import QwenEncoder
+
+        cfg = self.encoder_cfg
+        if cfg is None:
+            raise ValueError("model.context_encoder is not configured; cannot build a context encoder.")
+        return QwenEncoder(
+            model_id=cfg.model_id,
+            device=self.device,
+            dtype=cfg.dtype,
+            max_length=cfg.max_length,
+            freeze=cfg.freeze_encoder,
+            lora_rank=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            lora_target_modules=cfg.lora_target_modules,
+        )
+
+    def ensure_encoder(self):
+        if self.encoder is None:
+            self.encoder = self._build_encoder()
+        return self.encoder
+
     def load(self, path, use_ema=False):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         state = checkpoint
         if isinstance(checkpoint, dict) and ("model" in checkpoint or "ema" in checkpoint):
-            if use_ema and "ema" in checkpoint:
-                state = checkpoint["ema"]
-            else:
-                state = checkpoint["model"] if "model" in checkpoint else checkpoint["ema"]
+            key = "ema" if use_ema else "model"
+            assert key in checkpoint, f"Checkpoint {path} has no '{key}' state dict."
+            state = checkpoint[key]
         missing, unexpected = unwrap_model(self.net).load_state_dict(state, strict=False)
         if (
             self.encoder is not None
@@ -371,36 +383,42 @@ class QwenDiT:
     def encode(self, images):
         return self.vae.encode(images).latent_dist.sample().mul_(self.vae.config.scaling_factor)
 
-    def encode_context(self, captions, feedbacks, images):
-        from datasets.clevr.utils import build_context_text
-
-        texts = [
-            build_context_text(caption, None, feedback or None, include_metadata=False)
-            for caption, feedback in zip(captions, feedbacks)
-        ]
-        return self.encoder.encode(texts, images)
+    def encode_batch_context(self, batch):
+        """Encode a dataset batch's contexts: caption-only rows get empty histories,
+        single-feedback rows become 1-step histories."""
+        assert self.encoder is not None, "No context encoder available to encode batch contexts."
+        feedback_histories = []
+        image_histories = []
+        for feedback, image in zip(batch["feedback"], batch["generated_image"]):
+            assert bool(feedback) == (image is not None), (
+                "Feedback rows must carry a generated image and caption-only rows must not."
+            )
+            feedback_histories.append([feedback] if feedback else [])
+            image_histories.append([image] if image is not None else [])
+        return self.encoder.encode_history(batch["caption"], feedback_histories, image_histories)
 
     def loss(self, batch):
         x_latent = self.encode(batch["image"].to(self.device, non_blocking=True))
-        if self.encoder is not None:
-            context_tokens, context_mask = self.encode_context(
-                batch["caption"], batch["feedback"], batch["generated_image"]
-            )
-        else:
+        if "context_tokens" in batch and (self.encoder is None or self.encoder.freeze):
             context_tokens = batch["context_tokens"].to(self.device, non_blocking=True)
             context_mask = batch["context_mask"].to(self.device, non_blocking=True)
+        else:
+            context_tokens, context_mask = self.encode_batch_context(batch)
         return diffusion_loss(self.net, self.diffusion, x_latent, context_tokens, context_mask)
 
     @torch.no_grad()
     def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None):
         from algorithms.on_policy import PolicySampler
 
-        if self.encoder is not None:
-            count = len(batch["caption"])
-            context_tokens, context_mask = self.encode_context(batch["caption"], [""] * count, [None] * count)
-        else:
+        if "context_tokens" in batch and batch["context_tokens"] is not None:
             context_tokens = batch["context_tokens"]
             context_mask = batch["context_mask"]
+        else:
+            encoder = self.ensure_encoder()
+            captions = batch["caption"]
+            context_tokens, context_mask = encoder.encode_history(
+                captions, [[] for _ in captions], [[] for _ in captions]
+            )
         sampler = PolicySampler(
             create_diffusion(str(num_sampling_steps)),
             latent_size=self.latent_size,
@@ -439,6 +457,6 @@ class QwenDiT:
     def prepare_dataset(self, dataset):
         from datasets.clevr.dataset import context_collate
 
-        if self.encoder is not None:
+        if self.encoder is not None and not self.encoder.freeze:
             dataset.set_return_generated_images(True)
         return dataset, context_collate

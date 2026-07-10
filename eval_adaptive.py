@@ -13,7 +13,6 @@ import wandb
 from algorithms.eval import adaptive_rollout, distance_metrics, select_eval_batch
 from algorithms.on_policy import PolicySampler
 from algorithms.utils import save_trace_grid, write_json
-from datasets.clevr.utils import load_metadata_for_zarr, metadata_by_index
 from diffusion import create_diffusion
 from verifiers.eval_metrics import make_scorer
 
@@ -30,13 +29,9 @@ def main(cfg):
     model.load(cfg.ckpt, use_ema=cfg.use_ema)
     model.net.eval()
     verifier = hydra.utils.instantiate(cfg.verifier)
-    # A model with its own (finetuned) encoder must be evaluated with that encoder,
-    # not a fresh frozen one from the config.
-    if model.encoder is not None:
-        context_encoder = model.encoder
-    else:
-        context_encoder = hydra.utils.instantiate(cfg.context_encoder)
-    scorer = make_scorer(**cfg.scorer)
+    context_encoder = model.ensure_encoder()
+    context_encoder.eval()
+    scorer = make_scorer()
     sampler = PolicySampler(
         create_diffusion(str(cfg.sampling.num_sampling_steps)),
         latent_size=model.latent_size,
@@ -45,14 +40,11 @@ def main(cfg):
         ddim_eta=cfg.sampling.ddim_eta,
     )
 
-    metadata_rows = load_metadata_for_zarr(dataset.datasets[0].root)
     batch = select_eval_batch(dataset, cfg.caption_seed, cfg.num_captions)
-    if model.encoder is not None:
-        with torch.no_grad():
-            batch["context_tokens"], batch["context_mask"] = model.encoder.encode_history(
-                batch["caption"], [[] for _ in batch["caption"]], [[] for _ in batch["caption"]]
-            )
-    metadata = metadata_by_index(metadata_rows, batch["metadata_index"].tolist())
+    with torch.no_grad():
+        batch["context_tokens"], batch["context_mask"] = context_encoder.encode_history(
+            batch["caption"], [[] for _ in batch["caption"]], [[] for _ in batch["caption"]]
+        )
 
     traces, histories, token_count = adaptive_rollout(
         model.net,
@@ -61,7 +53,6 @@ def main(cfg):
         verifier,
         context_encoder,
         batch,
-        metadata,
         batch["gt_images"],
         steps=cfg.steps,
         seed=cfg.seed,

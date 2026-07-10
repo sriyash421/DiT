@@ -15,16 +15,12 @@ class LocalQwenVerifier(FeedbackVerifier):
         temperature=0.0,
         max_tokens=256,
         workers=1,
-        include_caption=True,
-        include_metadata=False,
         enable_thinking=False,
         image_size=None,
     ):
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
         self.workers = int(workers)
-        self.include_caption = bool(include_caption)
-        self.include_metadata = bool(include_metadata)
         self.enable_thinking = bool(enable_thinking)
         self.image_size = None if image_size is None else int(image_size)
         self.processor, self.model = load_vlm(model_id, device, dtype=qwen_dtype, device_map=device_map)
@@ -32,7 +28,7 @@ class LocalQwenVerifier(FeedbackVerifier):
     def _prepare_image(self, image):
         return resize_square(image, self.image_size) if self.image_size else image.convert("RGB")
 
-    def _messages_for(self, caption, metadata, gt_image, attempt_image):
+    def _messages_for(self, caption, gt_image, attempt_image, feedback_history):
         return [
             {
                 "role": "user",
@@ -42,10 +38,8 @@ class LocalQwenVerifier(FeedbackVerifier):
                     {
                         "type": "text",
                         "text": build_feedback_prompt(
-                            caption=caption,
-                            metadata=metadata,
-                            include_caption=self.include_caption,
-                            include_metadata=self.include_metadata,
+                            caption,
+                            feedback_history=feedback_history,
                             enable_thinking=self.enable_thinking,
                         ),
                     },
@@ -53,14 +47,14 @@ class LocalQwenVerifier(FeedbackVerifier):
             }
         ]
 
-    def verify_history_batch(self, captions, metadata, gt_images, attempt_images, feedback_histories):
-        return self.verify_batch(captions, metadata, gt_images, attempt_images)
-
     @torch.no_grad()
-    def verify_batch(self, captions, metadata, gt_images, attempt_images):
+    def verify(self, captions, gt_images, attempt_images, feedback_histories=None):
+        if feedback_histories is None:
+            feedback_histories = [[] for _ in captions]
+        assert len(captions) == len(gt_images) == len(attempt_images) == len(feedback_histories)
         messages = [
-            self._messages_for(caption, meta, gt, attempt)
-            for caption, meta, gt, attempt in zip(captions, metadata, gt_images, attempt_images)
+            self._messages_for(caption, gt, attempt, history)
+            for caption, gt, attempt, history in zip(captions, gt_images, attempt_images, feedback_histories)
         ]
         texts = [self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
         try:

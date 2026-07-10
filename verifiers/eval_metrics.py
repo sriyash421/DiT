@@ -10,5 +10,5 @@ def make_scorer(workers=16, max_tokens=16, timeout=120):
 
 def score(scorer, captions, gt_images, pred_images):
     """Score each (gt image, caption, predicted image) triple; returns a distance (0-9) or None per row."""
-    results = scorer.score_distance_batch(captions, [None] * len(captions), gt_images, pred_images)
+    results = scorer.score_distance(captions, gt_images, pred_images)
     return [result.score if result.ok else None for result in results]

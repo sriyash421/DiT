@@ -14,6 +14,31 @@ from omegaconf import OmegaConf
 import wandb
 
 
+def ensure_context_cache(cfg, device):
+    """Precompute stage-3 context tokens for frozen-encoder training when the dataset lacks them."""
+    if "context_encoder" not in cfg.model:
+        return
+    encoder_cfg = cfg.model.context_encoder
+    if not encoder_cfg.freeze_encoder or not cfg.dataset.load_context:
+        return
+    from datasets.clevr.encode_context import encode_context_tokens
+    from datasets.clevr.utils import zarr_has_context
+
+    if dist.get_rank() == 0:
+        for entry in cfg.dataset.datasets:
+            if zarr_has_context(entry.path):
+                continue
+            print(f"Precomputing context tokens for {entry.path} with {encoder_cfg.model_id}...")
+            encode_context_tokens(
+                entry.path,
+                encoder_cfg.model_id,
+                device,
+                max_context_len=encoder_cfg.max_length,
+                vlm_dtype=encoder_cfg.dtype,
+            )
+    dist.barrier()
+
+
 def make_experiment_dir(cfg):
     experiment_dir = Path(cfg.results_dir) / cfg.experiment_name
     if dist.get_rank() == 0:
@@ -40,6 +65,7 @@ def main(cfg):
     random.seed(seed)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    ensure_context_cache(cfg, device)
     dataset = hydra.utils.instantiate(cfg.dataset)
     model = hydra.utils.instantiate(cfg.model, context_dim=dataset.context_dim, device=device)
     if cfg.ckpt is not None:
