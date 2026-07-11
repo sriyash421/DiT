@@ -1,4 +1,9 @@
-"""Evaluate the adaptive feedback rollout: sample, get verifier feedback, re-encode, and resample."""
+"""Evaluate the adaptive feedback rollout: sample, get verifier feedback, re-encode, and resample.
+
+The model and dataset are rebuilt strictly from the training run's saved config.yaml (found one
+level above the checkpoint's `checkpoints/` dir). The verifier is picked from the shared
+`configs/verifier/*.yaml` files. Everything else is plain argparse."""
+import argparse
 from pathlib import Path
 
 import hydra
@@ -17,30 +22,78 @@ from diffusion import create_diffusion
 from verifiers.eval_metrics import make_scorer
 
 
-@hydra.main(config_path="configs", config_name="eval_adaptive", version_base=None)
-def main(cfg):
+def resolve_run(run_dir, step):
+    """Resolve a run dir + step into (training config, full checkpoint path); step=-1 = latest."""
+    run_dir = Path(run_dir)
+    cfg_path = run_dir / "config.yaml"
+    assert cfg_path.exists(), f"No training config at {cfg_path}; is {run_dir} a training run dir?"
+    ckpt_dir = run_dir / "checkpoints"
+    if step < 0:
+        steps = sorted(int(p.stem) for p in ckpt_dir.glob("*.pt") if not p.stem.endswith("-ema"))
+        assert steps, f"No checkpoints found in {ckpt_dir}."
+        step = steps[-1]
+    ckpt = ckpt_dir / f"{step:07d}.pt"
+    assert ckpt.exists(), f"Checkpoint {ckpt} does not exist."
+    print(f"Run {run_dir.name}: config={cfg_path.name}, ckpt={ckpt.name}")
+    return OmegaConf.load(cfg_path), str(ckpt)
+
+
+def build_verifier(name, api_url=None):
+    verifier_cfg_path = Path(__file__).parent / "configs" / "verifier" / f"{name}.yaml"
+    assert verifier_cfg_path.exists(), f"No verifier config at {verifier_cfg_path}."
+    verifier_cfg = OmegaConf.load(verifier_cfg_path)
+    if api_url is not None:
+        verifier_cfg.api_url = api_url
+    return hydra.utils.instantiate(verifier_cfg)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--run_dir", required=True, help="Training run dir (holds config.yaml and checkpoints/).")
+    p.add_argument("--step", type=int, default=-1, help="Checkpoint step to load; -1 for the latest.")
+    p.add_argument("--out_dir", default="results/eval_adaptive")
+    p.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--verifier", default="open_router", help="Name under configs/verifier/ (no .yaml).")
+    p.add_argument("--verifier_api_url", default=None, help="Override the verifier api_url (e.g. vllm node).")
+    p.add_argument("--split", default="val")
+    p.add_argument("--num_captions", type=int, default=8)
+    p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--caption_seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num_sampling_steps", type=int, default=50)
+    p.add_argument("--cfg_scale", type=float, default=1.0)
+    p.add_argument("--ddim_eta", type=float, default=0.0)
+    p.add_argument("--wandb_project", default="DiT-qwen-clevr")
+    p.add_argument("--wandb_name", default=None)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     device = 0
     torch.cuda.set_device(device)
-    out_dir = Path(cfg.out_dir)
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = hydra.utils.instantiate(cfg.dataset, split=cfg.split)
-    model = hydra.utils.instantiate(cfg.model, context_dim=dataset.context_dim, device=device)
-    model.load(cfg.ckpt, use_ema=cfg.use_ema)
+    train_cfg, ckpt = resolve_run(args.run_dir, args.step)
+    args.ckpt = ckpt
+    dataset = hydra.utils.instantiate(train_cfg.dataset, split=args.split)
+    model = hydra.utils.instantiate(train_cfg.model, context_dim=dataset.context_dim, device=device)
+    model.load(ckpt, use_ema=args.use_ema)
     model.net.eval()
-    verifier = hydra.utils.instantiate(cfg.verifier)
-    context_encoder = model.ensure_encoder()
+    verifier = build_verifier(args.verifier, api_url=args.verifier_api_url)
+    context_encoder = model.get_encoder()
     context_encoder.eval()
     scorer = make_scorer()
     sampler = PolicySampler(
-        create_diffusion(str(cfg.sampling.num_sampling_steps)),
+        create_diffusion(str(args.num_sampling_steps)),
         latent_size=model.latent_size,
         vae_scaling_factor=model.vae.config.scaling_factor,
-        cfg_scale=cfg.sampling.cfg_scale,
-        ddim_eta=cfg.sampling.ddim_eta,
+        cfg_scale=args.cfg_scale,
+        ddim_eta=args.ddim_eta,
     )
 
-    batch = select_eval_batch(dataset, cfg.caption_seed, cfg.num_captions)
+    batch = select_eval_batch(dataset, args.caption_seed, args.num_captions)
     with torch.no_grad():
         batch["context_tokens"], batch["context_mask"] = context_encoder.encode_history(
             batch["caption"], [[] for _ in batch["caption"]], [[] for _ in batch["caption"]]
@@ -54,8 +107,8 @@ def main(cfg):
         context_encoder,
         batch,
         batch["gt_images"],
-        steps=cfg.steps,
-        seed=cfg.seed,
+        steps=args.steps,
+        seed=args.seed,
         scorer=scorer,
     )
 
@@ -74,10 +127,10 @@ def main(cfg):
 
     metrics = distance_metrics(traces)
     results = {
-        "ckpt": cfg.ckpt,
-        "split": cfg.split,
-        "steps": cfg.steps,
-        "num_captions": cfg.num_captions,
+        "ckpt": args.ckpt,
+        "split": args.split,
+        "steps": args.steps,
+        "num_captions": args.num_captions,
         "verifier_tokens": token_count,
         "metrics": metrics,
         "captions": batch["caption"],
@@ -85,10 +138,10 @@ def main(cfg):
         "distances": [[entry["distance"] for entry in trace] for trace in traces],
     }
     write_json(out_dir / "results.json", results)
-    print(f"Adaptive eval over {cfg.num_captions} captions x {cfg.steps} steps: {metrics}")
+    print(f"Adaptive eval over {args.num_captions} captions x {args.steps} steps: {metrics}")
 
-    if cfg.wandb.name is not None:
-        wandb.init(project=cfg.wandb.project, name=cfg.wandb.name, config=OmegaConf.to_container(cfg, resolve=True))
+    if args.wandb_name is not None:
+        wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
         payload = {f"eval/{key}": value for key, value in metrics.items()}
         for idx in range(len(traces)):
             grid_path = out_dir / f"trace_{idx:03d}.png"

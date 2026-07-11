@@ -141,10 +141,16 @@ class FakeContextEncoder:
     def eval(self):
         pass
 
+    def prepare_row(self, caption, feedback_history, attempt_image_history):
+        return {"depth": len(feedback_history)}
+
+    def forward(self, rows):
+        tokens = torch.stack([torch.full((3, 3), float(row["depth"])) for row in rows])
+        return tokens, torch.ones(len(rows), 3, dtype=torch.bool)
+
     def encode_history(self, captions, feedback_histories, attempt_image_histories):
         assert len(captions) == len(feedback_histories) == len(attempt_image_histories)
-        tokens = torch.stack([torch.full((3, 3), float(len(history))) for history in feedback_histories])
-        return tokens, torch.ones(len(captions), 3, dtype=torch.bool)
+        return self.forward([self.prepare_row(c, h, i) for c, h, i in zip(captions, feedback_histories, attempt_image_histories)])
 
 
 class FakeVAE:
@@ -332,17 +338,16 @@ def test_rollout_collector_live_records_carry_no_tokens(tmp_path):
         sample_count=1,
         device=torch.device("cpu"),
     )
-    dataset = RolloutBuffer(tmp_path / "step_000001")
+    dataset = RolloutBuffer(tmp_path / "step_000001", prepare_fn=FakeContextEncoder().prepare_row)
 
     assert len(dataset) == 2
     assert all("context_tokens" not in record for record in dataset.records)
-    # __getitem__ decodes and caches the pre-attempt PILs on the record.
-    item = dataset[1]
-    assert len(item["history_attempt_images"]) == 1
-    assert "history_attempt_images" in dataset.records[1]
+    # __getitem__ tokenizes and caches the context inputs on the record once.
+    dataset[1]
+    assert "context_inputs" in dataset.records[1]
     batch_out = rollout_collate([dataset[0], dataset[1]])
     assert "context_tokens" not in batch_out
-    assert len(batch_out["history_attempt_images"]) == 2
+    assert len(batch_out["context_inputs"]) == 2
 
 
 def test_distributed_sampler_partitions_merged_rollout_buffer(tmp_path):
@@ -408,7 +413,6 @@ def test_rollout_collate_pads_records_from_disk_buffer(tmp_path):
     assert batch["x_latent"].shape == (2, 4, 2, 2)
     assert batch["context_tokens"].shape == (2, 3, 3)
     assert batch["context_mask"].all()
-    assert batch["history_attempt_images"] == [[], []]
 
 
 # ---------------------------------------------------------------------------

@@ -354,7 +354,7 @@ class OnPolicyTrainer:
         assert int(rollout.batch_size) % self.world_size == 0, "Rollout batch size must be divisible by world size."
         self.rollout_root = Path(rollout.storage_dir) if rollout.storage_dir is not None else self.log_dir / "rollouts"
 
-        self.encoder = model.ensure_encoder()
+        self.encoder = model.get_encoder()
         self.scorer = make_scorer() if self.rank == 0 else None
 
         self.ema = deepcopy(unwrap_model(model.net))
@@ -466,7 +466,8 @@ class OnPolicyTrainer:
         return global_stats, step_dir
 
     def update(self, outer_step, step_dir):
-        buffer_dataset = RolloutBuffer(step_dir)
+        prepare_fn = None if self.encoder.freeze else self.encoder.prepare_row
+        buffer_dataset = RolloutBuffer(step_dir, prepare_fn=prepare_fn)
         update_batch_size = min(self.local_batch_size, len(buffer_dataset))
         self.log_rollout_samples(buffer_dataset, outer_step)
         if rank_is_zero():
@@ -544,15 +545,13 @@ class OnPolicyTrainer:
 
     def compute_loss(self, batch):
         x_latent = batch["x_latent"].to(self.device, non_blocking=True)
-        if "context_tokens" in batch and self.encoder.freeze:
+        if self.encoder.freeze:
             context_tokens = batch["context_tokens"].to(self.device, non_blocking=True)
             context_mask = batch["context_mask"].to(self.device, non_blocking=True)
         else:
-            # Re-encode from raw text + attempt images so gradients reach the encoder
+            # Forward the tokenized (once) rollout contexts so gradients reach the encoder
             # and the context tracks its current weights, not rollout-time snapshots.
-            context_tokens, context_mask = self.encoder.encode_history(
-                batch["caption"], batch["feedback_history"], batch["history_attempt_images"]
-            )
+            context_tokens, context_mask = self.encoder.forward(batch["context_inputs"])
         loss = diffusion_loss(self.model.net, self.model.diffusion, x_latent, context_tokens, context_mask)
         return loss, {"loss": float(loss.item())}
 

@@ -8,7 +8,7 @@ hydra:
 
 ckpt: null
 results_dir: /gscratch/scrubbed/sriyash/DiT-qwen-clevr-base
-experiment_name: base_l4
+experiment_name: base_l4_final
 
 model:
   _target_: models.qwen_dit.QwenDiT

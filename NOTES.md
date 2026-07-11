@@ -6,23 +6,23 @@ Remaining oddities and intentional decisions after the encoder/verifier/context 
 
 - **"no update" verifier replies are ordinary feedback.** A "no update" reply is stored and
   conditioned on like any other feedback and the sample stays active in the rollout. Decided
-  2026-07-09; do not special-case it.
+  2026-07-09; do not special-case it. - this is okay
 - **`forward_with_cfg` splits off 3 channels** (`model_out[:, :3]`) while latents have 4. All
   configs run `cfg_scale: 1.0`, which never calls `forward_with_cfg`, so this is currently
-  unreachable from the training/eval paths. Left as-is on purpose; revisit before enabling CFG.
+  unreachable from the training/eval paths. Left as-is on purpose; revisit before enabling CFG. -- this is okay
 - **EMA covers only the DiT.** Encoder LoRA weights (when `freeze_encoder: false`) are saved in
-  the checkpoint's `context_encoder` entry but have no EMA copy.
+  the checkpoint's `context_encoder` entry but have no EMA copy. -- this is okay
 - **OmniGen DDP uses `find_unused_parameters=True`.** Full finetuning leaves some parameters
-  unused on individual steps and DDP errors without it. Cost: one extra graph scan per backward.
+  unused on individual steps and DDP errors without it. Cost: one extra graph scan per backward. -- this is okay
 - **On-policy launches need `OPENROUTER_API_KEY`** in addition to the verifier's key: the eval
   distance scorer is hardcoded to OpenRouter `google/gemini-3.1-flash-lite`
-  (`verifiers/eval_metrics.make_scorer`) and is built fail-fast at trainer init on rank 0.
+  (`verifiers/eval_metrics.make_scorer`) and is built fail-fast at trainer init on rank 0. -- this is okay
 
 ## Data regeneration required
 
 The cleanup changed the data formats, so existing artifacts under
 `/gscratch/scrubbed/sriyash/...` must be regenerated (stages 1 → 3, then update the dataset
-config paths):
+config paths): -- will do that! also re-running everything so it should be fine! not using any old data
 
 - Stage-2 images were center-cropped before resizing; they are now resized directly
   (CLEVR's 480×320 frames were losing their edges).

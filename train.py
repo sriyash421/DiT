@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 import wandb
 
 
-def ensure_context_cache(cfg, device):
+def generate_context_cache(cfg, device):
     """Precompute stage-3 context tokens for frozen-encoder training when the dataset lacks them."""
     if "context_encoder" not in cfg.model:
         return
@@ -65,7 +65,7 @@ def main(cfg):
     random.seed(seed)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
-    ensure_context_cache(cfg, device)
+    generate_context_cache(cfg, device)
     dataset = hydra.utils.instantiate(cfg.dataset)
     model = hydra.utils.instantiate(cfg.model, context_dim=dataset.context_dim, device=device)
     if cfg.ckpt is not None:

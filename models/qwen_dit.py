@@ -313,7 +313,7 @@ class QwenDiT:
         self.encoder_cfg = context_encoder
 
         # The encoder is a trainable component only when not frozen; a frozen encoder is
-        # built lazily via ensure_encoder() by the consumers that actually encode.
+        # built lazily via get_encoder() by the consumers that actually encode.
         self.encoder = None
         if context_encoder is not None and not context_encoder.freeze_encoder:
             self.encoder = self._build_encoder()
@@ -355,25 +355,25 @@ class QwenDiT:
             lora_target_modules=cfg.lora_target_modules,
         )
 
-    def ensure_encoder(self):
+    def get_encoder(self):
         if self.encoder is None:
             self.encoder = self._build_encoder()
         return self.encoder
 
     def load(self, path, use_ema=False):
+        # Always load the full "<step>.pt" (holds "model", "ema", and "context_encoder" LoRA).
+        # Load the base DiT, then swap in the EMA DiT weights if requested; the LoRA encoder is
+        # loaded as-is (EMA covers only the DiT, so there is no separate EMA copy of the LoRA).
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        state = checkpoint
-        if isinstance(checkpoint, dict) and ("model" in checkpoint or "ema" in checkpoint):
-            key = "ema" if use_ema else "model"
-            assert key in checkpoint, f"Checkpoint {path} has no '{key}' state dict."
-            state = checkpoint[key]
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            state = checkpoint["ema"] if use_ema else checkpoint["model"]
+        else:
+            state = checkpoint
         missing, unexpected = unwrap_model(self.net).load_state_dict(state, strict=False)
-        if (
-            self.encoder is not None
-            and not self.encoder.freeze
-            and isinstance(checkpoint, dict)
-            and "context_encoder" in checkpoint
-        ):
+        if self.encoder is not None and not self.encoder.freeze:
+            assert isinstance(checkpoint, dict) and "context_encoder" in checkpoint, (
+                f"Checkpoint {path} has no 'context_encoder' LoRA weights for an unfrozen encoder."
+            )
             from peft import set_peft_model_state_dict
 
             set_peft_model_state_dict(unwrap_model(self.encoder.model), checkpoint["context_encoder"])
@@ -414,7 +414,7 @@ class QwenDiT:
             context_tokens = batch["context_tokens"]
             context_mask = batch["context_mask"]
         else:
-            encoder = self.ensure_encoder()
+            encoder = self.get_encoder()
             captions = batch["caption"]
             context_tokens, context_mask = encoder.encode_history(
                 captions, [[] for _ in captions], [[] for _ in captions]

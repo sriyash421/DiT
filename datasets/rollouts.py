@@ -9,10 +9,16 @@ from datasets.clevr.dataset import pad_contexts
 
 
 class RolloutBuffer(Dataset):
-    """Merges per-rank records.pt shards written by RolloutCollector."""
+    """Merges per-rank records.pt shards written by RolloutCollector.
 
-    def __init__(self, path):
+    Frozen-encoder records already carry their context embeddings. For a LoRA encoder,
+    prepare_fn tokenizes each record's history once (reused across updates); the VLM
+    forward runs per update in the trainer.
+    """
+
+    def __init__(self, path, prepare_fn=None):
         self.path = Path(path)
+        self.prepare_fn = prepare_fn
         payloads = self._load_payloads(self.path)
         self.records = []
         self.stats = {"attempted": 0, "success": 0, "failed": 0, "gemini_tokens": 0}
@@ -37,23 +43,16 @@ class RolloutBuffer(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[int(idx)]
-        if "history_attempt_images" not in record:
-            record["history_attempt_images"] = [
-                Image.open(path).convert("RGB") for path in record["history_attempt_paths"]
-            ]
+        if "context_tokens" not in record and "context_inputs" not in record and self.prepare_fn is not None:
+            images = [Image.open(path).convert("RGB") for path in record["history_attempt_paths"]]
+            record["context_inputs"] = self.prepare_fn(record["caption"], record["feedback_history"], images)
         return record
 
 
 def rollout_collate(batch):
-    out = {
-        "x_latent": torch.stack([item["x_latent"] for item in batch]),
-        "caption": [item["caption"] for item in batch],
-        "feedback": [item["feedback"] for item in batch],
-        "feedback_history": [item["feedback_history"] for item in batch],
-        "history_attempt_paths": [item["history_attempt_paths"] for item in batch],
-        "history_attempt_images": [item["history_attempt_images"] for item in batch],
-        "attempt_path": [item["attempt_path"] for item in batch],
-    }
+    out = {"x_latent": torch.stack([item["x_latent"] for item in batch])}
     if "context_tokens" in batch[0]:
         out["context_tokens"], out["context_mask"] = pad_contexts([item["context_tokens"] for item in batch])
+    elif "context_inputs" in batch[0]:
+        out["context_inputs"] = [item["context_inputs"] for item in batch]
     return out

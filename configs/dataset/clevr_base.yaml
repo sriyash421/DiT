@@ -1,7 +1,7 @@
 _target_: datasets.build_clevr_dataset
 datasets:
   - name: base
-    path: /gscratch/scrubbed/sriyash/clevr_dit_dataset_filtered/data.zarr
+    path: /gscratch/scrubbed/sriyash/clevr_123objects_filtered/data.zarr
     sampling_ratio: 1.0
     max_dataset_size: null
 split: train
