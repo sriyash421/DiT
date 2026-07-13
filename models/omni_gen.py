@@ -219,6 +219,9 @@ class OmniGenModel:
         from huggingface_hub import snapshot_download
         from OmniGen import OmniGen, OmniGenProcessor
 
+        import OmniGen.scheduler as _sched
+        _sched.tqdm = lambda iterable, *args, **kwargs: iterable  # silence OmniGen's per-DDIM-step bar
+
         self.device = device
         self.image_height = int(image_height)
         self.image_width = int(image_width)

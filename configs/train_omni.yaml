@@ -1,5 +1,5 @@
 defaults:
-  - dataset: clevr_base
+  - dataset: clevr_base_five
   - _self_
 
 hydra:
@@ -8,7 +8,7 @@ hydra:
 
 ckpt: null
 results_dir: /gscratch/scrubbed/sriyash/OmniGen-clevr
-experiment_name: omni_lora_finetune
+experiment_name: omni_lora_finetune_five_objects
 
 dataset:
   image_size: 256
