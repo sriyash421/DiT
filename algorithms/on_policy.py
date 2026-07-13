@@ -25,7 +25,6 @@ from algorithms.utils import (
     rank_is_zero,
     requires_grad,
     save_checkpoint_atomic,
-    save_trace_grid,
     unwrap_model,
     update_ema,
 )
@@ -368,6 +367,8 @@ class OnPolicyTrainer:
         global_stats = all_reduce_rollout_stats(stats, self.device)
         max_rollout_seconds = all_reduce_scalar(rollout_seconds, self.device, op=dist.ReduceOp.MAX)
         self.cumulative_verifier_tokens += global_stats["gemini_tokens"]
+        # Feedback-verifier cost is per-rank (sum); the eval scorer runs on rank 0 only.
+        verifier_cost = all_reduce_scalar(getattr(self.verifier, "session_cost", 0.0), self.device)
         success_rate = global_stats["success"] / max(global_stats["attempted"], 1)
         if rank_is_zero():
             wandb.log({
@@ -380,6 +381,7 @@ class OnPolicyTrainer:
                 "rollout/samples_per_sec": global_stats["attempted"] / max(max_rollout_seconds, 1e-6),
                 "verifier/total_tokens": self.cumulative_verifier_tokens,
                 "verifier/tokens_this_rollout": global_stats["gemini_tokens"],
+                "verifier/total_session_cost": verifier_cost + getattr(self.scorer, "session_cost", 0.0),
             }, step=self.train_steps)
         self.logger.info(
             f"Rollout outer={outer_step:06d}: generated {global_stats['attempted']} attempts "
@@ -503,7 +505,7 @@ class OnPolicyTrainer:
 
     @torch.no_grad()
     def eval_step(self):
-        from algorithms.eval import adaptive_eval, distance_metrics
+        from algorithms.eval import adaptive_eval, distance_metrics, save_adaptive_trace_grid
 
         if not rank_is_zero() or self.val_dataset is None or len(self.val_dataset) == 0:
             return 0
@@ -513,7 +515,7 @@ class OnPolicyTrainer:
         captions = [self.val_dataset[idx]["caption"] for idx in indices]
         gt_images = [self.val_dataset.image_for_index(idx) for idx in indices]
 
-        traces, histories, eval_tokens = adaptive_eval(
+        traces, _histories, eval_tokens = adaptive_eval(
             self.model,
             self.verifier,
             captions,
@@ -524,22 +526,10 @@ class OnPolicyTrainer:
             sampler_cfg=self.sampler_cfg,
         )
 
-        trace_dir = self.log_dir / "adaptive_eval"
-        trace_images = []
-        for batch_idx, eval_index in enumerate(indices):
-            if not traces[batch_idx]:
-                continue
-            grid_path = trace_dir / f"step_{self.train_steps:07d}_idx_{eval_index:06d}.png"
-            feedback_text = "\n".join(histories[batch_idx])
-            save_trace_grid(
-                grid_path,
-                gt_images[batch_idx],
-                traces[batch_idx][0]["image"],
-                feedback_text,
-                traces[batch_idx][-1]["image"],
-            )
-            trace_images.append(wandb.Image(str(grid_path), caption=captions[batch_idx]))
-        metrics = {"eval/adaptive_traces": trace_images}
+        grid_path = self.log_dir / "adaptive_eval" / f"step_{self.train_steps:07d}.png"
+        metrics = {}
+        if save_adaptive_trace_grid(grid_path, traces, gt_images, captions) is not None:
+            metrics["eval/adaptive_traces"] = wandb.Image(str(grid_path))
         for key, value in distance_metrics(traces).items():
             metrics[f"eval/{key}"] = value
         wandb.log(metrics, step=self.train_steps)

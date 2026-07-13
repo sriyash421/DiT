@@ -17,12 +17,12 @@ from algorithms.on_policy import (
     all_reduce_rollout_stats,
     exact_update_batches,
 )
+from algorithms.eval import render_adaptive_trace
 from algorithms.utils import (
     build_optimizer_scheduler,
     diffusion_loss,
     load_checkpoint,
     requires_grad,
-    save_trace_grid,
     unwrap_model,
     update_ema,
     write_json,
@@ -49,7 +49,7 @@ from verifiers.base import (
     build_feedback_prompt,
     clean_feedback_text,
     normalize_chat_url,
-    parse_distance_score,
+    parse_mismatch_list,
 )
 from verifiers.gemini import DEFAULT_GEMINI_MODEL, GeminiVerifier
 from verifiers.open_router import OpenRouterVerifier
@@ -566,18 +566,24 @@ def test_feedback_prompt_with_history_includes_past_feedback():
     assert "return exactly: no update" in prompt
 
 
-def test_distance_prompt_asks_for_single_digit():
+def test_distance_prompt_lists_caption_mismatches():
     prompt = build_distance_prompt("a red cube")
     assert "Caption: a red cube" in prompt
-    assert "Return only one integer from 0 to 9." in prompt
+    assert "horizontal" in prompt and "depth" in prompt
+    assert "one mismatch per line" in prompt
+    # Caption-grounded, no GT-image references.
+    assert "Ground-truth" not in prompt and "image 1" not in prompt.lower()
 
 
-def test_parse_distance_score():
-    assert parse_distance_score("3") == 3.0
-    assert parse_distance_score("The answer is 7.") == 7.0
-    assert parse_distance_score("Image 2 needs 3 edits") == 3.0
-    with pytest.raises(ValueError):
-        parse_distance_score("no digits here")
+def test_parse_mismatch_list_counts_lines():
+    assert parse_mismatch_list("none") == 0.0
+    assert parse_mismatch_list("") == 0.0
+    assert parse_mismatch_list("- wrong color of cube\n- missing sphere") == 2.0
+    assert parse_mismatch_list("- one\n- two\n- three") == 3.0
+    # Preamble line without a bullet is ignored when bullets are present.
+    assert parse_mismatch_list("Mismatches:\n- a\n- b") == 2.0
+    # No bullets: count non-empty, non-'none' lines.
+    assert parse_mismatch_list("wrong cube color") == 1.0
 
 
 def test_clean_feedback_text():
@@ -905,7 +911,11 @@ def test_generates_attempt2_and_logs_outputs(runtime_config, base_batch, model_s
     idx = feedback["success_indices"][0]
     out_dir = runtime_config["out_dir"]
     grid_path = out_dir / "trace_grid.png"
-    save_trace_grid(grid_path, base_batch["gt_images"][idx], attempt1[idx], feedback["texts"][0], attempt2_images[0])
+    trace = [
+        {"image": attempt1[idx], "feedback_used": ""},
+        {"image": attempt2_images[0], "feedback_used": feedback["texts"][0]},
+    ]
+    render_adaptive_trace(trace, base_batch["gt_images"][idx], base_batch["batch"]["caption"][idx]).save(grid_path)
     write_json(out_dir / "metrics.json", {
         "checkpoint": runtime_config["ckpt"],
         "success_count": len(feedback["success_indices"]),

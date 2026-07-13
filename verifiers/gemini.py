@@ -47,8 +47,6 @@ class GeminiVerifier(FeedbackVerifier):
                 "role": "user",
                 "parts": [
                     {"text": build_feedback_prompt(caption, feedback_history=feedback_history)},
-                    {"text": "Ground-truth image:"},
-                    {"inline_data": {"mime_type": "image/png", "data": pil_to_png_base64(gt_image)}},
                     {"text": "Generated image:"},
                     {"inline_data": {"mime_type": "image/png", "data": pil_to_png_base64(attempt_image)}},
                 ],

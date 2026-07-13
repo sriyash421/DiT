@@ -1,5 +1,6 @@
 """Verifier over the OpenRouter chat completions API."""
 import os
+import threading
 
 from verifiers.base import OpenAIChatVerifier
 
@@ -30,4 +31,16 @@ class OpenRouterVerifier(OpenAIChatVerifier):
             workers=workers,
             enable_thinking=enable_thinking,
             image_size=image_size,
+            # Ask OpenRouter to return the USD cost of each call in usage.cost.
+            extra_payload={"usage": {"include": True}},
         )
+        # Running USD cost of all calls this verifier has made this session (requests run in a
+        # thread pool, so guard the accumulator). The trainer reads and logs it.
+        self.session_cost = 0.0
+        self._cost_lock = threading.Lock()
+
+    def _record_usage(self, usage):
+        cost = usage.get("cost")
+        if cost:
+            with self._cost_lock:
+                self.session_cost += float(cost)

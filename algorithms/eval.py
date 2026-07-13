@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -225,6 +225,104 @@ def distance_metrics(traces):
     return metrics
 
 
+def _wrap_text(draw, text, font, max_width):
+    """Greedy word-wrap `text` to `max_width` pixels; returns a list of lines (>=1)."""
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines, current = [], words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if draw.textbbox((0, 0), trial, font=font)[2] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def render_adaptive_trace(trace, gt_image, caption, tile=160):
+    """Render one adaptive-eval rollout as a strip image:
+
+    a caption banner on top, then attempt_0 --feedback_0--> attempt_1 --feedback_1--> ... across the
+    row, and finally the GT image (thick black border) at the far right. `trace` is the per-item list
+    of {"image", "feedback_used", ...} dicts in step order (as returned by adaptive_eval).
+    """
+    font = ImageFont.load_default()
+    measure = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    entries = list(trace) if trace else []
+    attempts = [entry["image"].convert("RGB").resize((tile, tile)) for entry in entries]
+    if not attempts:
+        attempts = [Image.new("RGB", (tile, tile), (230, 230, 230))]
+    # Feedback shown between attempt k and k+1 is the feedback that produced attempt k+1.
+    feedbacks = [str(entries[k + 1].get("feedback_used", "")) for k in range(len(entries) - 1)]
+    n = len(attempts)
+
+    conn_w, gap, pad, label_h = 168, 26, 12, 16
+    step = tile + conn_w
+    line_h = font.getbbox("Ay")[3] + 3
+    gt_x = pad + (n - 1) * step + tile + gap
+    width = gt_x + tile + pad
+
+    caption_lines = _wrap_text(measure, f"Caption: {caption}", font, width - 2 * pad)
+    caption_h = pad + line_h * len(caption_lines) + pad
+    height = caption_h + tile + label_h + pad
+
+    out = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(out)
+    for i, line in enumerate(caption_lines):
+        draw.text((pad, pad + i * line_h), line, fill=(0, 0, 0), font=font)
+
+    top = caption_h
+    for k, img in enumerate(attempts):
+        x = pad + k * step
+        out.paste(img, (x, top))
+        draw.rectangle((x, top, x + tile - 1, top + tile - 1), outline=(0, 0, 0), width=1)
+        draw.text((x + 4, top + tile + 2), f"attempt {k}", fill=(0, 0, 0), font=font)
+        if k < n - 1:
+            cx = x + tile
+            mid_y = top + tile // 2
+            fb_lines = _wrap_text(measure, feedbacks[k], font, conn_w - 16)[:4]
+            for i, line in enumerate(fb_lines):
+                draw.text((cx + 8, mid_y - line_h * len(fb_lines) - 4 + i * line_h), line, fill=(0, 0, 0), font=font)
+            draw.line((cx + 8, mid_y, cx + conn_w - 10, mid_y), fill=(0, 0, 0), width=2)
+            draw.polygon(
+                [(cx + conn_w - 4, mid_y), (cx + conn_w - 12, mid_y - 5), (cx + conn_w - 12, mid_y + 5)],
+                fill=(0, 0, 0),
+            )
+
+    gt = gt_image.convert("RGB").resize((tile, tile))
+    out.paste(gt, (gt_x, top))
+    draw.rectangle((gt_x, top, gt_x + tile - 1, top + tile - 1), outline=(0, 0, 0), width=max(4, tile // 32))
+    draw.text((gt_x + 4, top + tile + 2), "GT Image", fill=(0, 0, 0), font=font)
+    return out
+
+
+def save_adaptive_trace_grid(path, traces, gt_images, captions, tile=160):
+    """Stack one render_adaptive_trace strip per sample into a single grid image. Returns the path,
+    or None if no trace had any steps."""
+    rows = [
+        render_adaptive_trace(trace, gt_image, caption, tile=tile)
+        for trace, gt_image, caption in zip(traces, gt_images, captions)
+        if trace
+    ]
+    if not rows:
+        return None
+    gap = 18
+    width = max(row.width for row in rows)
+    height = sum(row.height for row in rows) + gap * (len(rows) - 1)
+    out = Image.new("RGB", (width, height), (255, 255, 255))
+    y = 0
+    for row in rows:
+        out.paste(row, (0, y))
+        y += row.height + gap
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.save(path)
+    return path
+
+
 def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=16):
     """Save a grid of GT | prediction pairs, plotting at most `max_images` pairs."""
     if max_images is not None:
@@ -248,7 +346,8 @@ def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=1
         draw.text((x + tile + 8, y + 4), "Pred", fill=(20, 20, 20))
         out.paste(gt.resize((tile, tile), Image.Resampling.LANCZOS), (x, y + label_h))
         out.paste(pred.resize((tile, tile), Image.Resampling.LANCZOS), (x + tile, y + label_h))
-        draw.rectangle((x, y + label_h, x + tile - 1, y + label_h + tile - 1), outline=(0, 0, 0))
+        # Thick black border around GT to mark it as the reference; thin border on the prediction.
+        draw.rectangle((x, y + label_h, x + tile - 1, y + label_h + tile - 1), outline=(0, 0, 0), width=max(3, tile // 32))
         draw.rectangle((x + tile, y + label_h, x + pair_w - 1, y + label_h + tile - 1), outline=(0, 0, 0))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

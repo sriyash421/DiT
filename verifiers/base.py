@@ -77,13 +77,13 @@ def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
         command_line = "Write one short command to fix image 2. "
     prompt = (
         "Give feedback for a CLEVR image generator. "
-        "Image 1 is correct; image 2 is generated.\n"
+        "You are shown the generated image; the caption is the only source of truth.\n"
         f"Caption: {caption}\n\n"
         f"{history_block}"
         f"{command_line}"
         "Use this priority: missing/extra object > shape > color > size > material > position/depth > background. "
         "Mention one object and one edit only. Do not use and. Do not explain. "
-        "If image 2 already follows the caption and is similar to image 1, return exactly: no update. "
+        "If the generated image already follows the caption, return exactly: no update. "
         "Return only the command, under 12 words."
     )
     if enable_thinking:
@@ -93,23 +93,34 @@ def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
 
 def build_distance_prompt(caption):
     return (
-        "Compare two CLEVR images. Image 1 is correct; image 2 is generated.\n"
+        "Check a generated CLEVR image against a caption.\n"
         f"Caption: {caption}\n\n"
-        "Estimate the minimum number of simple object edits needed to make image 2 match image 1. "
-        "If image 2 already matches image 1, return 0. "
-        "Count missing/extra object, shape, color, size, material, and position/depth errors as edits. "
-        "Return only one integer from 0 to 9."
+        "The caption lists the objects (each with size, color, material, shape), their left-to-right "
+        "(horizontal) order, and their front-to-back (depth) order. Compare the generated image to the "
+        "caption and list everything that does NOT match: any object with a wrong size, color, material, "
+        "or shape; a wrong horizontal order; a wrong depth order; and any missing or extra object. "
+        "Output only the list, one mismatch per line, each line starting with '- '. No preamble. "
+        "If everything matches, output exactly: none."
     )
 
 
-def parse_distance_score(text):
+def parse_mismatch_list(text):
+    """Distance = number of caption mismatches the VLM listed. 'none' (or empty) -> 0."""
     text = str(text).strip()
-    if re.fullmatch(r"[0-9]", text):
-        return float(int(text))
-    matches = re.findall(r"\b([0-9])\b", text)
-    if not matches:
-        raise ValueError(f"could not parse distance score from: {text!r}")
-    return float(int(matches[-1]))
+    if not text or text.lower().rstrip(".") in ("none", "no mismatches", "everything matches"):
+        return 0.0
+    bullet_lines = [
+        line for line in text.splitlines()
+        if line.strip().startswith(("-", "*", "•")) or re.match(r"^\s*\d+[.)]", line)
+    ]
+    if bullet_lines:
+        return float(len(bullet_lines))
+    # No bullets: count non-empty lines that aren't a "none"-style answer.
+    lines = [
+        line for line in text.splitlines()
+        if line.strip() and line.strip().lower().rstrip(".") not in ("none", "no mismatches", "everything matches")
+    ]
+    return float(len(lines))
 
 
 def total_tokens_from_usage(usage):
@@ -180,34 +191,35 @@ class OpenAIChatVerifier(FeedbackVerifier):
     def _prepare_image(self, image):
         return resize_square(image, self.image_size) if self.image_size else image
 
+    def _record_usage(self, usage):
+        """Hook for subclasses to accumulate per-call usage stats (e.g. OpenRouter cost). No-op here."""
+
     def _verify_row(self, caption, gt_image, attempt_image, feedback_history):
+        # gt_image is intentionally unused: feedback is judged against the caption only (no leakage).
         return self._post_prompt(
             build_feedback_prompt(
                 caption,
                 feedback_history=feedback_history,
                 enable_thinking=self.enable_thinking,
             ),
-            gt_image,
             attempt_image,
             parse_feedback=True,
         )
 
     def _distance_row(self, caption, gt_image, attempt_image):
+        # gt_image unused: mismatches are counted against the caption, not the GT image.
         return self._post_prompt(
             build_distance_prompt(caption),
-            gt_image,
             attempt_image,
             parse_feedback=False,
         )
 
-    def _post_prompt(self, prompt, gt_image, attempt_image, parse_feedback=True):
+    def _post_prompt(self, prompt, attempt_image, parse_feedback=True):
         import requests
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         content = [
             {"type": "text", "text": prompt},
-            {"type": "text", "text": "Ground-truth image:"},
-            {"type": "image_url", "image_url": {"url": image_to_data_url(self._prepare_image(gt_image))}},
             {"type": "text", "text": "Generated image:"},
             {"type": "image_url", "image_url": {"url": image_to_data_url(self._prepare_image(attempt_image))}},
         ]
@@ -224,13 +236,14 @@ class OpenAIChatVerifier(FeedbackVerifier):
                 response.raise_for_status()
                 result = response.json()
                 usage = result.get("usage", {}) or {}
+                self._record_usage(usage)
                 text = result["choices"][0]["message"]["content"]
                 feedback = clean_feedback_text(text) if parse_feedback else str(text).strip()
                 if not feedback and parse_feedback:
                     raise ValueError("empty feedback")
                 score = None
                 if not parse_feedback:
-                    score = parse_distance_score(feedback)
+                    score = parse_mismatch_list(feedback)
                 return VerificationResult(
                     ok=True,
                     feedback=feedback,

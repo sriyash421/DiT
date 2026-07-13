@@ -17,8 +17,8 @@ from omegaconf import OmegaConf
 from types import SimpleNamespace
 
 import wandb
-from algorithms.eval import adaptive_eval, distance_metrics, select_eval_batch
-from algorithms.utils import save_trace_grid, write_json
+from algorithms.eval import adaptive_eval, distance_metrics, render_adaptive_trace, select_eval_batch
+from algorithms.utils import write_json
 from verifiers.eval_metrics import make_scorer
 
 
@@ -104,12 +104,8 @@ def main():
     for idx, trace in enumerate(traces):
         if not trace:
             continue
-        save_trace_grid(
-            out_dir / f"trace_{idx:03d}.png",
-            batch["gt_images"][idx],
-            trace[0]["image"],
-            "\n".join(histories[idx]),
-            trace[-1]["image"],
+        render_adaptive_trace(trace, batch["gt_images"][idx], batch["caption"][idx]).save(
+            out_dir / f"trace_{idx:03d}.png"
         )
         for step, entry in enumerate(trace):
             entry["image"].save(out_dir / f"caption_{idx:03d}_step_{step:02d}.png")

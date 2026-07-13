@@ -81,23 +81,6 @@ def normalized_tensor_to_pil(x):
     return Image.fromarray(x.permute(1, 2, 0).numpy(), mode="RGB")
 
 
-def save_trace_grid(path, gt_image, attempt1, feedback, attempt2):
-    """Save a GT | first attempt | last attempt strip with the feedback text beside it."""
-    from PIL import ImageDraw
-
-    tile_w, tile_h = gt_image.size
-    text_w = max(tile_w, 360)
-    out = Image.new("RGB", (tile_w * 3 + text_w, tile_h), (255, 255, 255))
-    out.paste(gt_image.convert("RGB").resize((tile_w, tile_h)), (0, 0))
-    out.paste(attempt1.convert("RGB").resize((tile_w, tile_h)), (tile_w, 0))
-    out.paste(attempt2.convert("RGB").resize((tile_w, tile_h)), (tile_w * 2, 0))
-    draw = ImageDraw.Draw(out)
-    draw.text((tile_w * 3 + 8, 8), feedback[:1000], fill=(20, 20, 20))
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    out.save(path)
-
-
 def create_logger(log_dir, rank):
     """Rank 0 logs to console and <log_dir>/log.txt; other ranks are silent."""
     logger = logging.getLogger("dit")
