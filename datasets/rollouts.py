@@ -5,20 +5,18 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from datasets.clevr.dataset import pad_contexts
-
 
 class RolloutBuffer(Dataset):
     """Merges per-rank records.pt shards written by RolloutCollector.
 
-    Frozen-encoder records already carry their context embeddings. For a LoRA encoder,
-    prepare_fn tokenizes each record's history once (reused across updates); the VLM
-    forward runs per update in the trainer.
+    Each record stores the RAW interleaved history that produced an accepted attempt: the caption,
+    the feedbacks and attempt-image paths of all prior attempts, plus the GT path. The model turns
+    this history into a loss (QwenDiT encodes it; OmniGen builds a multi-image edit example), so the
+    buffer is model-agnostic and stores no encoded context.
     """
 
-    def __init__(self, path, prepare_fn=None):
+    def __init__(self, path):
         self.path = Path(path)
-        self.prepare_fn = prepare_fn
         payloads = self._load_payloads(self.path)
         self.records = []
         self.stats = {"attempted": 0, "success": 0, "failed": 0, "gemini_tokens": 0}
@@ -43,16 +41,20 @@ class RolloutBuffer(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[int(idx)]
-        if "context_tokens" not in record and "context_inputs" not in record and self.prepare_fn is not None:
-            images = [Image.open(path).convert("RGB") for path in record["history_attempt_paths"]]
-            record["context_inputs"] = self.prepare_fn(record["caption"], record["feedback_history"], images)
-        return record
+        return {
+            "gt_image": Image.open(record["gt_path"]).convert("RGB"),
+            "caption": record["caption"],
+            "feedback_history": list(record["feedback_history"]),
+            "attempt_images": [Image.open(path).convert("RGB") for path in record["attempt_paths"]],
+            "attempt_paths": list(record["attempt_paths"]),
+            # passthrough for logging (log_rollout_samples reads paths, not the PILs)
+            "gt_path": record["gt_path"],
+            "attempt_path": record["attempt_path"],
+            "feedback": record["feedback"],
+        }
 
 
 def rollout_collate(batch):
-    out = {"x_latent": torch.stack([item["x_latent"] for item in batch])}
-    if "context_tokens" in batch[0]:
-        out["context_tokens"], out["context_mask"] = pad_contexts([item["context_tokens"] for item in batch])
-    elif "context_inputs" in batch[0]:
-        out["context_inputs"] = [item["context_inputs"] for item in batch]
-    return out
+    """Group rollout rows into per-field lists; the model's rollout_loss does tensor conversion."""
+    keys = ("gt_image", "caption", "feedback_history", "attempt_images", "attempt_paths")
+    return {key: [item[key] for item in batch] for key in keys}

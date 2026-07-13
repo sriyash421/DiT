@@ -14,11 +14,11 @@ torch.backends.cudnn.allow_tf32 = True
 
 from omegaconf import OmegaConf
 
+from types import SimpleNamespace
+
 import wandb
-from algorithms.eval import adaptive_rollout, distance_metrics, select_eval_batch
-from algorithms.on_policy import PolicySampler
+from algorithms.eval import adaptive_eval, distance_metrics, select_eval_batch
 from algorithms.utils import save_trace_grid, write_json
-from diffusion import create_diffusion
 from verifiers.eval_metrics import make_scorer
 
 
@@ -82,34 +82,23 @@ def main():
     model.load(ckpt, use_ema=args.use_ema)
     model.net.eval()
     verifier = build_verifier(args.verifier, api_url=args.verifier_api_url)
-    context_encoder = model.get_encoder()
-    context_encoder.eval()
     scorer = make_scorer()
-    sampler = PolicySampler(
-        create_diffusion(str(args.num_sampling_steps)),
-        latent_size=model.latent_size,
-        vae_scaling_factor=model.vae.config.scaling_factor,
+
+    batch = select_eval_batch(dataset, args.caption_seed, args.num_captions)
+    sampler_cfg = SimpleNamespace(
+        num_sampling_steps=args.num_sampling_steps,
         cfg_scale=args.cfg_scale,
         ddim_eta=args.ddim_eta,
     )
-
-    batch = select_eval_batch(dataset, args.caption_seed, args.num_captions)
-    with torch.no_grad():
-        batch["context_tokens"], batch["context_mask"] = context_encoder.encode_history(
-            batch["caption"], [[] for _ in batch["caption"]], [[] for _ in batch["caption"]]
-        )
-
-    traces, histories, token_count = adaptive_rollout(
-        model.net,
-        model.vae,
-        sampler,
+    traces, histories, token_count = adaptive_eval(
+        model,
         verifier,
-        context_encoder,
-        batch,
+        batch["caption"],
         batch["gt_images"],
         steps=args.steps,
         seed=args.seed,
         scorer=scorer,
+        sampler_cfg=sampler_cfg,
     )
 
     for idx, trace in enumerate(traces):

@@ -8,7 +8,7 @@ from diffusers.models import AutoencoderKL
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from algorithms.utils import diffusion_loss, unwrap_model
+from algorithms.utils import diffusion_loss, tensor_to_pil, unwrap_model
 from diffusion import create_diffusion
 
 
@@ -302,6 +302,77 @@ DiT_models = {
 }
 
 
+class PolicySampler:
+    """Samples images from a DiT with DDIM/DDPM, optionally with classifier-free guidance."""
+
+    def __init__(
+        self,
+        diffusion,
+        latent_size,
+        vae_scaling_factor,
+        cfg_scale=1.0,
+        sampler="ddim",
+        ddim_eta=0.0,
+    ):
+        self.diffusion = diffusion
+        self.latent_size = int(latent_size)
+        self.vae_scaling_factor = float(vae_scaling_factor)
+        self.cfg_scale = float(cfg_scale)
+        self.sampler = sampler
+        self.ddim_eta = float(ddim_eta)
+
+    @torch.no_grad()
+    def sample(self, model, vae, context_tokens, context_mask, device, seed=None):
+        module = unwrap_model(model)
+        was_training = module.training
+        module.eval()
+        batch_size = int(context_tokens.shape[0])
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(int(seed))
+        z = torch.randn(
+            batch_size,
+            4,
+            self.latent_size,
+            self.latent_size,
+            device=device,
+            generator=generator,
+        )
+        model_dtype = next(module.parameters()).dtype
+        model_kwargs = {
+            "context_tokens": context_tokens.to(device=device, dtype=model_dtype),
+            "context_mask": context_mask.to(device=device),
+        }
+        if self.cfg_scale > 1:
+            z = torch.cat([z, z], dim=0)
+            model_kwargs = {
+                "context_tokens": model_kwargs["context_tokens"].repeat(2, 1, 1),
+                "context_mask": model_kwargs["context_mask"].repeat(2, 1),
+                "cfg_scale": self.cfg_scale,
+            }
+            forward_fn = module.forward_with_cfg
+        else:
+            forward_fn = module.forward
+
+        sample_loop = self.diffusion.ddim_sample_loop if self.sampler == "ddim" else self.diffusion.p_sample_loop
+        samples = sample_loop(
+            forward_fn,
+            z.shape,
+            z,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            progress=False,
+            device=device,
+            **({"eta": self.ddim_eta} if self.sampler == "ddim" else {}),
+        )
+        if self.cfg_scale > 1:
+            samples, _ = samples.chunk(2, dim=0)
+        decoded = vae.decode(samples / self.vae_scaling_factor).sample
+        if was_training:
+            module.train()
+        return decoded, [tensor_to_pil(image) for image in decoded]
+
+
 class QwenDiT:
     """Qwen-conditioned DiT with its frozen VAE, training diffusion, and optional context encoder."""
 
@@ -337,6 +408,9 @@ class QwenDiT:
         ).to(device)
         self.vae = AutoencoderKL.from_pretrained(vae).to(device).eval()
         self.diffusion = create_diffusion(timestep_respacing="")
+        from datasets.clevr.utils import build_clevr_transform
+
+        self.transform = build_clevr_transform(self.image_size)
 
     def _build_encoder(self):
         from models.qwen_vlm import QwenEncoder
@@ -406,18 +480,27 @@ class QwenDiT:
             context_tokens, context_mask = self.encode_batch_context(batch)
         return diffusion_loss(self.net, self.diffusion, x_latent, context_tokens, context_mask)
 
+    def rollout_loss(self, batch):
+        """Train the DiT on rollout rows, encoding each row's full interleaved history."""
+        images = torch.stack([self.transform(image) for image in batch["gt_image"]])
+        x_latent = self.encode(images.to(self.device, non_blocking=True))
+        context_tokens, context_mask = self.get_encoder().encode_history(
+            batch["caption"], batch["feedback_history"], batch["attempt_images"]
+        )
+        return diffusion_loss(self.net, self.diffusion, x_latent, context_tokens, context_mask)
+
     @torch.no_grad()
     def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None):
-        from algorithms.on_policy import PolicySampler
-
-        if "context_tokens" in batch and batch["context_tokens"] is not None:
+        if batch.get("context_tokens") is not None:
             context_tokens = batch["context_tokens"]
             context_mask = batch["context_mask"]
         else:
-            encoder = self.get_encoder()
             captions = batch["caption"]
-            context_tokens, context_mask = encoder.encode_history(
-                captions, [[] for _ in captions], [[] for _ in captions]
+            empty = [[] for _ in captions]
+            context_tokens, context_mask = self.get_encoder().encode_history(
+                captions,
+                batch.get("feedback_history", empty),
+                batch.get("attempt_images", empty),
             )
         sampler = PolicySampler(
             create_diffusion(str(num_sampling_steps)),

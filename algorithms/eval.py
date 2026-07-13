@@ -125,29 +125,49 @@ def select_eval_batch(dataset, seed, count):
 
 
 @torch.no_grad()
-def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, gt_images, steps, seed, scorer):
-    """Iteratively sample, score against GT, and refine with verifier feedback.
+def adaptive_eval(model, verifier, captions, gt_images, steps, seed, scorer, sampler_cfg):
+    """Model-agnostic adaptive rollout for eval: iteratively `model.generate`, score against GT,
+    and refine with verifier feedback, conditioning each attempt on the full prior history.
 
-    Makes `steps` predictions and asks for feedback only steps-1 times.
-    Returns (traces, histories, token_count): per-item lists of {image, feedback_used, distance} steps,
-    the feedback given to each item, and the verifier tokens spent.
+    Makes `steps` predictions and asks for feedback only steps-1 times. Returns
+    (traces, histories, token_count): per-item lists of {image, feedback_used, distance} steps, the
+    feedback given to each item, and the verifier tokens spent. Attempts are written to a temp dir
+    so image-conditioned models (OmniGen) can reference prior attempts by path.
     """
-    count = int(batch["context_tokens"].shape[0])
-    device = next(net.parameters()).device
+    import tempfile
+
+    count = len(captions)
     histories = [[] for _ in range(count)]
-    history_images = [[] for _ in range(count)]
+    attempt_image_history = [[] for _ in range(count)]
+    attempt_path_history = [[] for _ in range(count)]
     traces = [[] for _ in range(count)]
     active = list(range(count))
-    current_tokens = batch["context_tokens"]
-    current_mask = batch["context_mask"]
     token_count = 0
+    tmp_dir = Path(tempfile.mkdtemp(prefix="adaptive_eval_"))
 
     for step in range(steps):
         if not active:
             break
-        _, attempt_images = sampler.sample(net, vae, current_tokens, current_mask, device, seed=seed + step)
-        active_captions = [batch["caption"][idx] for idx in active]
+        context_batch = {
+            "caption": [captions[idx] for idx in active],
+            "feedback_history": [list(histories[idx]) for idx in active],
+            "attempt_images": [list(attempt_image_history[idx]) for idx in active],
+            "attempt_paths": [list(attempt_path_history[idx]) for idx in active],
+        }
+        attempt_images = model.generate(
+            context_batch,
+            num_sampling_steps=int(sampler_cfg.num_sampling_steps),
+            cfg_scale=float(sampler_cfg.cfg_scale),
+            ddim_eta=float(sampler_cfg.ddim_eta),
+            seed=seed + step,
+        )
+        active_captions = [captions[idx] for idx in active]
         active_gt_images = [gt_images[idx] for idx in active]
+        attempt_paths = []
+        for pos, batch_idx in enumerate(active):
+            path = tmp_dir / f"idx_{batch_idx:04d}_step_{step:02d}.png"
+            attempt_images[pos].save(path)
+            attempt_paths.append(str(path))
         score_results = scorer.score_distance(active_captions, active_gt_images, attempt_images)
         token_count += sum(int(result.token_count) for result in score_results)
         for pos, batch_idx in enumerate(active):
@@ -162,30 +182,23 @@ def adaptive_rollout(net, vae, sampler, verifier, context_encoder, batch, gt_ima
 
         if step + 1 >= steps:
             break
-        active_histories = [list(histories[idx]) for idx in active]
         results = verifier.verify(
             active_captions,
             active_gt_images,
             attempt_images,
-            active_histories,
+            [list(histories[idx]) for idx in active],
         )
         token_count += sum(int(result.token_count) for result in results)
-        success_positions = [idx for idx, result in enumerate(results) if result.ok]
+        success_positions = [pos for pos, result in enumerate(results) if result.ok]
         if not success_positions:
             break
         next_active = []
-        next_captions = []
-        next_histories = []
-        next_history_images = []
         for pos in success_positions:
             batch_idx = active[pos]
             histories[batch_idx].append(results[pos].feedback)
-            history_images[batch_idx].append(attempt_images[pos])
+            attempt_image_history[batch_idx].append(attempt_images[pos])
+            attempt_path_history[batch_idx].append(attempt_paths[pos])
             next_active.append(batch_idx)
-            next_captions.append(batch["caption"][batch_idx])
-            next_histories.append(list(histories[batch_idx]))
-            next_history_images.append(list(history_images[batch_idx]))
-        current_tokens, current_mask = context_encoder.encode_history(next_captions, next_histories, next_history_images)
         active = next_active
 
     return traces, histories, token_count
@@ -212,8 +225,11 @@ def distance_metrics(traces):
     return metrics
 
 
-def save_gt_pred_grid(path, gt_images, pred_images, cols=10, gap=12):
-    """Save a grid of GT | prediction pairs."""
+def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=16):
+    """Save a grid of GT | prediction pairs, plotting at most `max_images` pairs."""
+    if max_images is not None:
+        gt_images = gt_images[:max_images]
+        pred_images = pred_images[:max_images]
     tile = 128
     pair_w = tile * 2
     label_h = 24

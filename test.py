@@ -13,7 +13,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from algorithms.on_policy import (
     OnPolicyTrainer,
-    PolicySampler,
     RolloutCollector,
     all_reduce_rollout_stats,
     exact_update_batches,
@@ -40,7 +39,7 @@ from datasets.clevr.utils import (
 from datasets.rollouts import RolloutBuffer, rollout_collate
 from diffusion import create_diffusion
 from models.omni_gen import training_losses as omni_training_losses
-from models.qwen_dit import DiT, DiT_models
+from models.qwen_dit import DiT, DiT_models, PolicySampler
 from models.qwen_vlm import build_history_messages
 from verifiers import build_verifier
 from verifiers.base import (
@@ -100,20 +99,6 @@ def grad_l2_norm(model):
 # Fakes.
 # ---------------------------------------------------------------------------
 
-class FakeSampler:
-    def __init__(self):
-        self.models = []
-
-    def sample(self, model, vae, context_tokens, context_mask, device, seed=None):
-        del vae, context_mask, device, seed
-        self.models.append(model)
-        images = [
-            Image.new("RGB", (8, 8), (idx * 40, 20, 10))
-            for idx in range(int(context_tokens.shape[0]))
-        ]
-        return torch.zeros(len(images), 3, 8, 8), images
-
-
 class FakeVerifier:
     def __init__(self):
         self.calls = 0
@@ -129,49 +114,25 @@ class FakeVerifier:
         ]
 
 
-class FakeContextEncoder:
-    """Encodes each row to 3 tokens filled with its history length, so tests can check
-    which history depth a context was encoded from."""
-
-    freeze = True
-
-    def train(self):
-        pass
-
-    def eval(self):
-        pass
-
-    def prepare_row(self, caption, feedback_history, attempt_image_history):
-        return {"depth": len(feedback_history)}
-
-    def forward(self, rows):
-        tokens = torch.stack([torch.full((3, 3), float(row["depth"])) for row in rows])
-        return tokens, torch.ones(len(rows), 3, dtype=torch.bool)
-
-    def encode_history(self, captions, feedback_histories, attempt_image_histories):
-        assert len(captions) == len(feedback_histories) == len(attempt_image_histories)
-        return self.forward([self.prepare_row(c, h, i) for c, h, i in zip(captions, feedback_histories, attempt_image_histories)])
+SAMPLER_CFG = SimpleNamespace(num_sampling_steps=2, cfg_scale=1.0, ddim_eta=0.0)
 
 
-class FakeVAE:
-    class Config:
-        scaling_factor = 1.0
+class FakeModel:
+    """Implements the abstract on-policy interface (generate + rollout_loss) used by the collector.
 
-    class LatentDist:
-        def __init__(self, batch_size):
-            self.batch_size = batch_size
+    generate records the full-history context batches it receives so tests can assert conditioning.
+    """
 
-        def sample(self):
-            return torch.ones(self.batch_size, 4, 2, 2)
+    def __init__(self):
+        self.generate_batches = []
 
-    class Encoded:
-        def __init__(self, batch_size):
-            self.latent_dist = FakeVAE.LatentDist(batch_size)
+    def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None):
+        del num_sampling_steps, cfg_scale, ddim_eta, seed
+        self.generate_batches.append(batch)
+        return [Image.new("RGB", (8, 8), (idx * 40, 20, 10)) for idx in range(len(batch["caption"]))]
 
-    config = Config()
-
-    def encode(self, x):
-        return self.Encoded(int(x.shape[0]))
+    def rollout_loss(self, batch):
+        return torch.tensor(float(len(batch["caption"])), requires_grad=True)
 
 
 class RecordingDistributedSampler(DistributedSampler):
@@ -184,25 +145,24 @@ class RecordingDistributedSampler(DistributedSampler):
         super().set_epoch(epoch)
 
 
-def make_rollout_record(idx, attempt_path=None, with_context=True):
-    record = {
-        "x_latent": torch.full((4, 2, 2), float(idx)),
-        "caption": f"caption {idx}",
-        "feedback": f"feedback {idx}",
-        "feedback_history": [],
-        "history_attempt_paths": [],
-        "gt_path": f"gt-{idx}.png",
-        "attempt_path": str(attempt_path or f"attempt-{idx}.png"),
-    }
-    if with_context:
-        record["context_tokens"] = torch.ones(3, 3) * (idx + 10)
-    return record
-
-
-def save_rollout_payload(path, start, count, tokens=0, with_context=True):
+def save_rollout_payload(path, start, count, tokens=0):
+    """Write a records.pt shard with real GT PNGs (RolloutBuffer opens the paths)."""
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    records = [make_rollout_record(start + idx, with_context=with_context) for idx in range(count)]
+    gt_dir = path / "gt"
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for idx in range(count):
+        row_idx = start + idx
+        gt_path = gt_dir / f"{row_idx:06d}.png"
+        Image.new("RGB", (8, 8), (row_idx * 10 % 255, 0, 0)).save(gt_path)
+        records.append({
+            "gt_path": str(gt_path),
+            "caption": f"caption {row_idx}",
+            "feedback_history": [],
+            "attempt_paths": [],
+            "attempt_path": str(gt_path),  # reused so logging tests find an existing file
+            "feedback": f"feedback {row_idx}",
+        })
     torch.save(
         {
             "records": records,
@@ -242,15 +202,8 @@ def test_rollout_collector_length_one_never_verifies(tmp_path):
     }
     data_sampler = RecordingDistributedSampler(TensorDataset(torch.arange(2)))
     verifier = FakeVerifier()
-    collector = RolloutCollector(
-        model="ema-model",
-        vae=FakeVAE(),
-        sampler=FakeSampler(),
-        verifier=verifier,
-        encoder=FakeContextEncoder(),
-        preprocess_context=True,
-        rollout_length=1,
-    )
+    model = FakeModel()
+    collector = RolloutCollector(model=model, sampler_cfg=SAMPLER_CFG, verifier=verifier, rollout_length=1)
 
     stats = collector.collect(
         [batch],
@@ -270,10 +223,10 @@ def test_rollout_collector_length_one_never_verifies(tmp_path):
     assert (tmp_path / "step_000001" / "rank_000" / "gt" / "000000.png").exists()
     assert (tmp_path / "step_000001" / "rank_000" / "attempts" / "000001_step_00.png").exists()
     assert dataset[0]["gt_path"].endswith("gt/000000.png")
-    assert dataset[0]["step_index"] == 0
     assert dataset[0]["feedback"] == ""
-    # Depth-0 records store the caption-only context (history length 0).
-    assert torch.equal(dataset[0]["context_tokens"], torch.zeros(3, 3, dtype=torch.float16))
+    assert dataset[0]["feedback_history"] == []
+    # Step-0 generation is conditioned on caption only (empty history).
+    assert model.generate_batches[0]["feedback_history"] == [[], []]
 
 
 def test_rollout_collector_multi_step_verifies_k_minus_one_times(tmp_path):
@@ -282,15 +235,8 @@ def test_rollout_collector_multi_step_verifies_k_minus_one_times(tmp_path):
         "caption": ["a", "b"],
     }
     verifier = FakeVerifier()
-    collector = RolloutCollector(
-        model="ema-model",
-        vae=FakeVAE(),
-        sampler=FakeSampler(),
-        verifier=verifier,
-        encoder=FakeContextEncoder(),
-        preprocess_context=True,
-        rollout_length=3,
-    )
+    model = FakeModel()
+    collector = RolloutCollector(model=model, sampler_cfg=SAMPLER_CFG, verifier=verifier, rollout_length=3)
 
     stats = collector.collect(
         [batch],
@@ -304,50 +250,18 @@ def test_rollout_collector_multi_step_verifies_k_minus_one_times(tmp_path):
     assert stats == {"attempted": 6, "success": 6, "failed": 0, "gemini_tokens": 44}
     assert verifier.calls == 2
     assert len(dataset) == 6
-    assert [dataset[idx]["step_index"] for idx in range(len(dataset))] == [0, 0, 1, 1, 2, 2]
+    # Records are appended per step: [a0, b0, a1, b1, a2, b2].
     assert dataset[0]["feedback_history"] == []
     assert dataset[0]["feedback"] == "fix a step 0"
     assert dataset[2]["feedback_history"] == ["fix a step 0"]
-    assert len(dataset[4]["history_attempt_paths"]) == 2
+    assert len(dataset[4]["attempt_paths"]) == 2
     assert dataset[4]["feedback"] == ""
     assert Path(dataset[4]["attempt_path"]).exists()
-    # A depth-k record stores the context encoded from its pre-attempt history of length k.
-    assert torch.equal(dataset[0]["context_tokens"], torch.zeros(3, 3, dtype=torch.float16))
-    assert torch.equal(dataset[2]["context_tokens"], torch.full((3, 3), 1.0, dtype=torch.float16))
-    assert torch.equal(dataset[4]["context_tokens"], torch.full((3, 3), 2.0, dtype=torch.float16))
-
-
-def test_rollout_collector_live_records_carry_no_tokens(tmp_path):
-    batch = {
-        "image": torch.zeros(1, 3, 8, 8),
-        "caption": ["a"],
-    }
-    collector = RolloutCollector(
-        model="raw-model",
-        vae=FakeVAE(),
-        sampler=FakeSampler(),
-        verifier=FakeVerifier(),
-        encoder=FakeContextEncoder(),
-        preprocess_context=False,
-        rollout_length=2,
-    )
-
-    collector.collect(
-        [batch],
-        tmp_path / "step_000001" / "rank_000",
-        sample_count=1,
-        device=torch.device("cpu"),
-    )
-    dataset = RolloutBuffer(tmp_path / "step_000001", prepare_fn=FakeContextEncoder().prepare_row)
-
-    assert len(dataset) == 2
-    assert all("context_tokens" not in record for record in dataset.records)
-    # __getitem__ tokenizes and caches the context inputs on the record once.
-    dataset[1]
-    assert "context_inputs" in dataset.records[1]
-    batch_out = rollout_collate([dataset[0], dataset[1]])
-    assert "context_tokens" not in batch_out
-    assert len(batch_out["context_inputs"]) == 2
+    # Each step conditions on the FULL prior history: step k sees k prior attempts + feedbacks.
+    assert model.generate_batches[0]["feedback_history"][0] == []
+    assert model.generate_batches[1]["feedback_history"][0] == ["fix a step 0"]
+    assert model.generate_batches[2]["feedback_history"][0] == ["fix a step 0", "fix a step 1"]
+    assert len(model.generate_batches[2]["attempt_images"][0]) == 2
 
 
 def test_distributed_sampler_partitions_merged_rollout_buffer(tmp_path):
@@ -374,45 +288,23 @@ def test_exact_update_batches_restarts_epochs_and_stops_exactly():
     assert sampler.epochs == [0, 1, 2]
 
 
-def test_rollout_use_ema_model_selection_with_collector(tmp_path):
-    batch = {
-        "image": torch.zeros(1, 3, 8, 8),
-        "caption": ["a"],
-    }
-    for use_ema, expected_model in ((True, "ema"), (False, "raw")):
-        fake_sampler = FakeSampler()
-        collector = RolloutCollector(
-            model="ema" if use_ema else "raw",
-            vae=FakeVAE(),
-            sampler=fake_sampler,
-            verifier=FakeVerifier(),
-            encoder=FakeContextEncoder(),
-            preprocess_context=True,
-        )
-        collector.collect(
-            [batch],
-            tmp_path / f"use_ema_{use_ema}" / "rank_000",
-            sample_count=1,
-            device=torch.device("cpu"),
-        )
-        assert fake_sampler.models == [expected_model]
-
-
 def test_all_reduce_rollout_stats_keeps_token_total_without_dist():
     stats = {"attempted": 2, "success": 1, "failed": 1, "gemini_tokens": 33}
 
     assert all_reduce_rollout_stats(stats, torch.device("cpu")) == stats
 
 
-def test_rollout_collate_pads_records_from_disk_buffer(tmp_path):
+def test_rollout_collate_groups_records_from_disk_buffer(tmp_path):
     step_dir = tmp_path / "step_000001"
     save_rollout_payload(step_dir / "rank_000", 0, 2)
     dataset = RolloutBuffer(step_dir)
     batch = rollout_collate([dataset[0], dataset[1]])
 
-    assert batch["x_latent"].shape == (2, 4, 2, 2)
-    assert batch["context_tokens"].shape == (2, 3, 3)
-    assert batch["context_mask"].all()
+    assert batch["caption"] == ["caption 0", "caption 1"]
+    assert len(batch["gt_image"]) == 2
+    assert batch["feedback_history"] == [[], []]
+    assert batch["attempt_images"] == [[], []]
+    assert batch["attempt_paths"] == [[], []]
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +347,7 @@ def test_dit_param_names_match_pre_refactor_checkpoints():
     assert fingerprint == PARAM_NAME_FINGERPRINT, "DiT parameter names changed; old checkpoints will break."
 
 
-def test_diffusion_loss_and_compute_loss():
+def test_diffusion_loss_is_finite():
     model = tiny_dit()
     diffusion = create_diffusion(timestep_respacing="")
     x_latent = torch.randn(2, 4, 8, 8)
@@ -465,15 +357,6 @@ def test_diffusion_loss_and_compute_loss():
     torch.manual_seed(0)
     loss = diffusion_loss(model, diffusion, x_latent, tokens, mask)
     assert torch.isfinite(loss)
-
-    trainer = OnPolicyTrainer.__new__(OnPolicyTrainer)
-    trainer.model = SimpleNamespace(net=model, diffusion=diffusion)
-    trainer.encoder = FakeContextEncoder()
-    trainer.device = torch.device("cpu")
-    batch = {"x_latent": x_latent, "context_tokens": tokens, "context_mask": mask}
-    total, stats = trainer.compute_loss(batch)
-    assert torch.isfinite(total)
-    assert stats["loss"] == pytest.approx(float(total.item()))
 
 
 def test_omni_vendored_training_losses():
@@ -535,8 +418,8 @@ def test_render_caption_chain_template():
     caption = render_caption(CAPTION_ROW)
     assert caption == (
         "objects: large red rubber cube, small blue metal sphere. "
-        "horizontal: blue sphere is right of red cube. "
-        "depth: red cube is behind blue sphere."
+        "horizontal: red cube, blue sphere. "
+        "depth: blue sphere, red cube."
     )
 
 

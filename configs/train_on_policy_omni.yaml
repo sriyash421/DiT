@@ -1,0 +1,89 @@
+defaults:
+  - dataset: clevr_on_policy
+  - verifier: vllm_qwen
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+verifier:
+  api_url: http://g3104:8000/v1
+
+ckpt: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_lora_finetune/checkpoints/0010000.pt
+results_dir: /gscratch/scrubbed/sriyash/omni-clevr-on-policy
+experiment_name: on_policy__omni_l4
+
+dataset:
+  image_size: 256
+
+model:
+  _target_: models.omni_gen.OmniGenModel
+  model_name_or_path: Shitao/OmniGen-v1
+  image_height: 256
+  image_width: 256
+  vae: null
+  lora_finetune: false
+  lora_rank: 128
+  lora_alpha: 128
+  lora_init: gaussian
+  lora_target_modules:
+    - qkv_proj
+    - o_proj
+    - gate_up_proj
+    - down_proj
+  gradient_checkpointing: false
+  mixed_precision: bf16
+  condition_dropout_prob: 0.0
+  max_input_length_limit: 18000
+  use_feedback_images: false
+  keep_raw_resolution: false
+
+trainer:
+  _target_: algorithms.on_policy.OnPolicyTrainer
+  verifier: ${verifier}
+  val_dataset:
+    _target_: datasets.build_clevr_dataset
+    datasets: ${dataset.datasets}
+    split: val
+    image_size: ${dataset.image_size}
+    use_disk: true
+    load_meta: true
+    load_images: false
+    load_context: false
+  sampler:
+    type: ddim
+    num_sampling_steps: 50
+    cfg_scale: 1.0
+    ddim_eta: 0.0
+  rollout:
+    samples: 128
+    length: 2
+    use_ema: true
+    storage_dir: null
+    log_samples: 8
+    batch_size: 32
+  lr: 1e-5
+  weight_decay: 0.0
+  global_batch_size: 16
+  global_seed: 0
+  updates_per_rollout: 1000
+  max_train_steps: 10000
+  grad_clip: 1.0
+  ema_decay: 0.99
+  log_every: 50
+  ckpt_every: 500
+  dataloader:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    caption_index: 20
+    batch_size: 8
+    seed: 0
+    steps: 2
+
+wandb:
+  project: DiT-qwen-clevr

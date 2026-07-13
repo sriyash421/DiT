@@ -41,27 +41,18 @@ def unique_labels(objects):
     return labels
 
 
-def adjacent_chain(labels, order, relation):
-    return ", ".join(
-        f"{labels[order[idx + 1]]} is {relation} {labels[order[idx]]}"
-        for idx in range(len(order) - 1)
-    )
-
-
 def render_caption(row):
-    """Render the chain caption from a structured metadata row.
-
-    Relation chains are empty for single-object scenes, so their sections are dropped.
-    """
+    """Render the caption from a structured metadata row: the objects, then their
+    left-to-right and front-to-back orderings. Ordering sections are dropped for
+    single-object scenes."""
     objects = row["objects"]
     labels = unique_labels(objects)
     object_list = ", ".join(full_description(obj) for obj in objects)
-    horizontal = adjacent_chain(labels, row["orders"]["left_to_right"], "right of")
-    depth = adjacent_chain(labels, row["orders"]["front_to_back"], "behind")
     parts = [f"objects: {object_list}."]
-    if horizontal:
+    if len(objects) > 1:
+        horizontal = ", ".join(labels[idx] for idx in row["orders"]["left_to_right"])
+        depth = ", ".join(labels[idx] for idx in row["orders"]["front_to_back"])
         parts.append(f"horizontal: {horizontal}.")
-    if depth:
         parts.append(f"depth: {depth}.")
     return " ".join(parts)
 

@@ -63,6 +63,22 @@ def training_losses(model, x1, model_kwargs):
     return {"loss": loss}
 
 
+def history_instruction(caption, feedback_history):
+    """OmniGen prompt for a rollout context with full interleaved history.
+
+    No history -> the raw caption (matches text-to-image training). With N prior attempts, all N
+    are referenced as contiguous <|image_1|>..<|image_N|> placeholders (the count the processor
+    requires) followed by their feedback, plus the edit instruction.
+    """
+    if not feedback_history:
+        return caption
+    images = " ".join(f"<|image_{idx + 1}|>" for idx in range(len(feedback_history)))
+    feedbacks = " ".join(f"Feedback {idx}: {str(feedback).strip()}" for idx, feedback in enumerate(feedback_history))
+    return (
+        f"{images} Edit the input image so it matches this CLEVR description: {caption}. {feedbacks}"
+    )
+
+
 class OmniClevrDataset(Dataset):
     """Adapts CLEVR rows to OmniGen text (and image-edit) training examples."""
 
@@ -249,6 +265,7 @@ class OmniGenModel:
         self.vae = AutoencoderKL.from_pretrained(vae).to(device=device, dtype=torch.float32).eval()
         for param in self.vae.parameters():
             param.requires_grad = False
+        self._rollout_collator = None
 
     def load(self, path, use_ema=False):
         from algorithms.utils import load_checkpoint
@@ -288,6 +305,35 @@ class OmniGenModel:
         }, self.device)
         return training_losses(self.net, output_latents, model_kwargs)["loss"].mean()
 
+    def rollout_loss(self, batch):
+        """Turn rollout rows (full history) into OmniGen edit examples and run the flow loss.
+
+        Mirrors OmniClevrDataset/OmniClevrCollator: each row's prior attempts become input images
+        for a multi-image edit instruction; the GT is the output image. Reuses self.loss.
+        """
+        if self._rollout_collator is None:
+            from algorithms.utils import unwrap_model
+
+            self._rollout_collator = OmniClevrCollator(
+                self.processor,
+                hidden_size=unwrap_model(self.net).llm.config.hidden_size,
+                keep_raw_resolution=self.keep_raw_resolution,
+            )
+        features = []
+        for gt_image, caption, feedback_history, attempt_images in zip(
+            batch["gt_image"], batch["caption"], batch["feedback_history"], batch["attempt_images"]
+        ):
+            instruction = history_instruction(caption, feedback_history)
+            input_images = [self.transform(image) for image in attempt_images] or None
+            mllm_input = self.processor.process_multi_modal_prompt(instruction, input_images)
+            features.append({
+                "mllm_input": mllm_input,
+                "output_image": self.transform(gt_image),
+                "source_index": 0,
+                "is_feedback": bool(feedback_history),
+            })
+        return self.loss(self._rollout_collator(features))
+
     @torch.no_grad()
     def generate(self, batch, num_sampling_steps, cfg_scale=2.5, ddim_eta=0.0, seed=None):
         from OmniGen import OmniGenPipeline
@@ -295,13 +341,22 @@ class OmniGenModel:
         from algorithms.utils import unwrap_model
 
         pipeline = OmniGenPipeline(vae=self.vae, model=unwrap_model(self.net), processor=self.processor, device=self.device)
+        captions = batch["caption"]
+        feedback_histories = batch.get("feedback_history", [[] for _ in captions])
+        attempt_paths = batch.get("attempt_paths", [[] for _ in captions])
+        prompts = [history_instruction(caption, history) for caption, history in zip(captions, feedback_histories)]
+        input_images = [list(paths) for paths in attempt_paths]
+        # Within a rollout step every active item shares the same history length, so image
+        # guidance is all-or-nothing. The OmniGen pipeline takes image PATHS (already on disk).
+        use_img_guidance = any(paths for paths in input_images)
         images = pipeline(
-            prompt=batch["caption"],
+            prompt=prompts,
+            input_images=input_images if use_img_guidance else None,
             height=self.image_height,
             width=self.image_width,
             num_inference_steps=num_sampling_steps,
             guidance_scale=cfg_scale,
-            use_img_guidance=False,
+            use_img_guidance=use_img_guidance,
             seed=seed,
         )
         return images

@@ -1,0 +1,34 @@
+defaults:
+  - train_on_policy_omni
+  - _self_
+
+experiment_name: on_policy_omni_debug
+
+dataset:
+  datasets:
+    - name: base
+      path: /gscratch/scrubbed/sriyash/clevr_123objects_filtered/data.zarr
+      sampling_ratio: 1.0
+      max_dataset_size: 500
+
+trainer:
+  val_dataset:
+    split: train
+  global_batch_size: 8
+  updates_per_rollout: 5
+  max_train_steps: 20
+  log_every: 1
+  ckpt_every: 20
+  rollout:
+    samples: 16
+    length: 2
+    batch_size: 8
+    log_samples: 4
+  dataloader:
+    num_workers: 2
+    prefetch_factor: 2
+    drop_last: false
+  eval:
+    caption_index: 0
+    batch_size: 4
+    steps: 2

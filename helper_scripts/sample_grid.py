@@ -13,8 +13,8 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from algorithms.on_policy import PolicySampler
 from algorithms.utils import load_checkpoint
+from models.qwen_dit import PolicySampler
 from datasets.clevr.dataset import ClevrContextDataset, pad_contexts
 from diffusion import create_diffusion
 from models.qwen_dit import DiT_models

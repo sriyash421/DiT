@@ -1,4 +1,11 @@
-"""On-policy feedback distillation: rollout generation, verification, and training."""
+"""On-policy feedback distillation: rollout generation, verification, and training.
+
+Model-agnostic: the trainer orchestrates rollout -> verify -> update but delegates every
+model-specific operation to the model (`generate` for sampling attempts, `rollout_loss` for the
+update). It never touches an encoder, sampler, VAE, or diffusion, so it trains both QwenDiT and
+OmniGen. Attempts condition on the full interleaved history; records store that raw history.
+"""
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from time import time
@@ -13,91 +20,17 @@ from algorithms.utils import (
     build_optimizer_scheduler,
     create_logger,
     dataloader_kwargs,
-    diffusion_loss,
     normalized_tensor_to_pil,
     progress_bar,
     rank_is_zero,
     requires_grad,
     save_checkpoint_atomic,
     save_trace_grid,
-    tensor_to_pil,
     unwrap_model,
     update_ema,
 )
 from datasets.clevr.dataset import context_collate
 from datasets.rollouts import RolloutBuffer, rollout_collate
-from diffusion import create_diffusion
-
-
-class PolicySampler:
-    """Samples images from a DiT with DDIM/DDPM, optionally with classifier-free guidance."""
-
-    def __init__(
-        self,
-        diffusion,
-        latent_size,
-        vae_scaling_factor,
-        cfg_scale=1.0,
-        sampler="ddim",
-        ddim_eta=0.0,
-    ):
-        self.diffusion = diffusion
-        self.latent_size = int(latent_size)
-        self.vae_scaling_factor = float(vae_scaling_factor)
-        self.cfg_scale = float(cfg_scale)
-        self.sampler = sampler
-        self.ddim_eta = float(ddim_eta)
-
-    @torch.no_grad()
-    def sample(self, model, vae, context_tokens, context_mask, device, seed=None):
-        module = unwrap_model(model)
-        was_training = module.training
-        module.eval()
-        batch_size = int(context_tokens.shape[0])
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device=device).manual_seed(int(seed))
-        z = torch.randn(
-            batch_size,
-            4,
-            self.latent_size,
-            self.latent_size,
-            device=device,
-            generator=generator,
-        )
-        model_dtype = next(module.parameters()).dtype
-        model_kwargs = {
-            "context_tokens": context_tokens.to(device=device, dtype=model_dtype),
-            "context_mask": context_mask.to(device=device),
-        }
-        if self.cfg_scale > 1:
-            z = torch.cat([z, z], dim=0)
-            model_kwargs = {
-                "context_tokens": model_kwargs["context_tokens"].repeat(2, 1, 1),
-                "context_mask": model_kwargs["context_mask"].repeat(2, 1),
-                "cfg_scale": self.cfg_scale,
-            }
-            forward_fn = module.forward_with_cfg
-        else:
-            forward_fn = module.forward
-
-        sample_loop = self.diffusion.ddim_sample_loop if self.sampler == "ddim" else self.diffusion.p_sample_loop
-        samples = sample_loop(
-            forward_fn,
-            z.shape,
-            z,
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            progress=False,
-            device=device,
-            **({"eta": self.ddim_eta} if self.sampler == "ddim" else {}),
-        )
-        if self.cfg_scale > 1:
-            samples, _ = samples.chunk(2, dim=0)
-        decoded = vae.decode(samples / self.vae_scaling_factor).sample
-        if was_training:
-            module.train()
-        return decoded, [tensor_to_pil(image) for image in decoded]
 
 
 def _slice_batch(batch, count):
@@ -111,23 +44,35 @@ def _slice_batch(batch, count):
 
 
 class RolloutCollector:
-    """Samples attempts, verifies them, and writes accepted (latent, context) records to disk.
+    """Samples attempts via model.generate, verifies them, and writes accepted records to disk.
 
-    A rollout of length K makes K predictions and verifies only the first K-1: feedback on
-    the final attempt is never used to make another prediction. A depth-k record trains
-    C_k -> GT, where C_k is the interleaved history that generated attempt k (caption-only
-    at depth 0). When preprocess_context is True (frozen encoder) each record also stores
-    its C_k tokens so training reads them straight from the buffer.
+    A rollout of length K makes K predictions and verifies only the first K-1: feedback on the
+    final attempt is never used to make another prediction. Each attempt conditions on the FULL
+    prior interleaved history (caption, attempt_0, feedback_0, ...). A record stores the raw
+    history that generated its attempt (caption + prior feedbacks + prior attempt-image paths) plus
+    the GT path; the model turns that history into a loss at update time.
     """
 
-    def __init__(self, model, vae, sampler, verifier, encoder, preprocess_context, rollout_length=1):
+    def __init__(self, model, sampler_cfg, verifier, rollout_length=1):
         self.model = model
-        self.vae = vae
-        self.sampler = sampler
+        self.sampler_cfg = sampler_cfg
         self.verifier = verifier
-        self.encoder = encoder
-        self.preprocess_context = bool(preprocess_context)
         self.rollout_length = max(1, int(rollout_length))
+
+    def _generate(self, active, captions, feedback_history, attempt_image_history, attempt_path_history, seed):
+        context_batch = {
+            "caption": [captions[idx] for idx in active],
+            "feedback_history": [list(feedback_history[idx]) for idx in active],
+            "attempt_images": [list(attempt_image_history[idx]) for idx in active],
+            "attempt_paths": [list(attempt_path_history[idx]) for idx in active],
+        }
+        return self.model.generate(
+            context_batch,
+            num_sampling_steps=int(self.sampler_cfg.num_sampling_steps),
+            cfg_scale=float(self.sampler_cfg.cfg_scale),
+            ddim_eta=float(self.sampler_cfg.ddim_eta),
+            seed=seed,
+        )
 
     @torch.no_grad()
     def collect(self, loader, output_dir, sample_count, device, seed=None, progress=None, data_sampler=None, epoch=0):
@@ -161,29 +106,25 @@ class RolloutCollector:
             if batch_size == 0:
                 continue
 
-            x_img = batch["image"].to(device)
             captions = batch["caption"]
             gt_images = [normalized_tensor_to_pil(image) for image in batch["image"]]
-            x_latents = self.vae.encode(x_img).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+            gt_paths = []
+            for local_idx in range(batch_size):
+                gt_path = gt_dir / f"{base_attempted + local_idx:06d}.png"
+                gt_images[local_idx].save(gt_path)
+                gt_paths.append(str(gt_path))
 
             active = list(range(batch_size))
-            current_tokens, current_mask = self.encoder.encode_history(
-                captions, [[] for _ in captions], [[] for _ in captions]
-            )
-            histories = [[] for _ in range(batch_size)]
-            history_paths = [[] for _ in range(batch_size)]
-            history_images = [[] for _ in range(batch_size)]
+            feedback_history = [[] for _ in range(batch_size)]
+            attempt_image_history = [[] for _ in range(batch_size)]
+            attempt_path_history = [[] for _ in range(batch_size)]
 
             for step_idx in range(self.rollout_length):
                 if not active:
                     break
-                _, attempt_images = self.sampler.sample(
-                    self.model,
-                    self.vae,
-                    current_tokens,
-                    current_mask,
-                    device,
-                    seed=None if seed is None else int(seed) + base_attempted * self.rollout_length + step_idx,
+                step_seed = None if seed is None else int(seed) + base_attempted * self.rollout_length + step_idx
+                attempt_images = self._generate(
+                    active, captions, feedback_history, attempt_image_history, attempt_path_history, step_seed
                 )
                 sampled_attempts += len(active)
                 is_last = step_idx + 1 >= self.rollout_length
@@ -195,58 +136,36 @@ class RolloutCollector:
                         [captions[idx] for idx in active],
                         [gt_images[idx] for idx in active],
                         attempt_images,
-                        [list(histories[idx]) for idx in active],
+                        [list(feedback_history[idx]) for idx in active],
                     )
                     token_count += sum(int(result.token_count) for result in results)
-                    success_positions = [idx for idx, result in enumerate(results) if result.ok]
+                    success_positions = [pos for pos, result in enumerate(results) if result.ok]
                     failed += len(results) - len(success_positions)
 
                 next_active = []
-                next_captions = []
-                next_histories = []
-                next_history_images = []
                 for pos in success_positions:
                     batch_idx = active[pos]
                     feedback = results[pos].feedback if results is not None else ""
                     record_id = len(records)
                     attempt_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.png"
-                    gt_path = gt_dir / f"{record_id:06d}.png"
                     attempt_images[pos].save(attempt_path)
-                    if not gt_path.exists():
-                        gt_images[batch_idx].save(gt_path)
-
-                    record = {
-                        "x_latent": x_latents[batch_idx].detach().cpu().float(),
+                    records.append({
+                        "gt_path": gt_paths[batch_idx],
                         "caption": captions[batch_idx],
-                        "feedback": feedback,
-                        "feedback_history": list(histories[batch_idx]),
-                        "history_attempt_paths": list(history_paths[batch_idx]),
-                        "step_index": int(step_idx),
-                        "gt_path": str(gt_path),
+                        "feedback_history": list(feedback_history[batch_idx]),
+                        "attempt_paths": list(attempt_path_history[batch_idx]),
                         "attempt_path": str(attempt_path),
-                    }
-                    if self.preprocess_context:
-                        context_valid = current_mask[pos].detach().cpu().bool()
-                        record["context_tokens"] = current_tokens[pos].detach().cpu()[context_valid].to(torch.float16)
-                    records.append(record)
-
+                        "feedback": feedback,
+                    })
                     if not is_last:
-                        histories[batch_idx].append(feedback)
-                        history_paths[batch_idx].append(str(attempt_path))
-                        history_images[batch_idx].append(attempt_images[pos])
+                        feedback_history[batch_idx].append(feedback)
+                        attempt_image_history[batch_idx].append(attempt_images[pos])
+                        attempt_path_history[batch_idx].append(str(attempt_path))
                         next_active.append(batch_idx)
-                        next_captions.append(captions[batch_idx])
-                        next_histories.append(list(histories[batch_idx]))
-                        next_history_images.append(list(history_images[batch_idx]))
 
                 active = next_active
                 if is_last or not active:
                     break
-                current_tokens, current_mask = self.encoder.encode_history(
-                    next_captions,
-                    next_histories,
-                    next_history_images,
-                )
 
             base_attempted += batch_size
             if progress is not None:
@@ -354,7 +273,6 @@ class OnPolicyTrainer:
         assert int(rollout.batch_size) % self.world_size == 0, "Rollout batch size must be divisible by world size."
         self.rollout_root = Path(rollout.storage_dir) if rollout.storage_dir is not None else self.log_dir / "rollouts"
 
-        self.encoder = model.get_encoder()
         self.scorer = make_scorer() if self.rank == 0 else None
 
         self.ema = deepcopy(unwrap_model(model.net))
@@ -362,27 +280,15 @@ class OnPolicyTrainer:
         self.ema.eval()
         model.net.train()
 
-        self.policy_sampler = PolicySampler(
-            create_diffusion(str(sampler.num_sampling_steps)),
-            latent_size=model.latent_size,
-            vae_scaling_factor=model.vae.config.scaling_factor,
-            cfg_scale=sampler.cfg_scale,
-            sampler=sampler.type,
-            ddim_eta=sampler.ddim_eta,
-        )
         self.collector = RolloutCollector(
-            model=self.ema if rollout.use_ema else model.net,
-            vae=model.vae,
-            sampler=self.policy_sampler,
+            model=model,
+            sampler_cfg=sampler,
             verifier=verifier,
-            encoder=self.encoder,
-            preprocess_context=self.encoder.freeze,
             rollout_length=rollout.length,
         )
 
-        trainable_params = model.trainable_parameters()
-        self.params = trainable_params
-        self.opt, _ = build_optimizer_scheduler(trainable_params, lr=lr, weight_decay=weight_decay)
+        self.params = model.trainable_parameters()
+        self.opt, _ = build_optimizer_scheduler(self.params, lr=lr, weight_decay=weight_decay)
 
         self.rollout_sampler = DistributedSampler(
             dataset,
@@ -406,6 +312,24 @@ class OnPolicyTrainer:
         self.pin_memory = bool(dataloader.pin_memory)
         self.logger.info(f"Dataset contains {len(dataset):,} rows.")
 
+    @contextmanager
+    def _ema_weights(self):
+        """Swap EMA weights into the live net for the duration of the block, then restore.
+
+        Used so rollouts generate from the EMA policy without a separate model copy. A no-op when
+        rollout.use_ema is False.
+        """
+        if not self.rollout_cfg.use_ema:
+            yield
+            return
+        module = unwrap_model(self.model.net)
+        saved_weights = {name: tensor.detach().clone() for name, tensor in module.state_dict().items()}
+        module.load_state_dict(self.ema.state_dict())
+        try:
+            yield
+        finally:
+            module.load_state_dict(saved_weights)
+
     def learn(self):
         outer_total = (self.max_train_steps + self.updates_per_rollout - 1) // self.updates_per_rollout
         for outer_step in progress_bar(range(1, outer_total + 1), total=outer_total, desc="on-policy steps"):
@@ -426,17 +350,17 @@ class OnPolicyTrainer:
         local_samples = samples_for_rank(int(self.rollout_cfg.samples), self.rank, self.world_size)
         collect_progress = progress_bar(total=local_samples, desc=f"collect {outer_step:06d}")
         rollout_start = time()
-        self.encoder.eval()
-        stats = self.collector.collect(
-            self.rollout_loader,
-            shard_dir,
-            sample_count=local_samples,
-            device=self.device,
-            seed=self.global_seed + outer_step * 1_000_000 + self.rank,
-            progress=collect_progress if hasattr(collect_progress, "update") else None,
-            data_sampler=self.rollout_sampler,
-            epoch=outer_step,
-        )
+        with self._ema_weights():
+            stats = self.collector.collect(
+                self.rollout_loader,
+                shard_dir,
+                sample_count=local_samples,
+                device=self.device,
+                seed=self.global_seed + outer_step * 1_000_000 + self.rank,
+                progress=collect_progress if hasattr(collect_progress, "update") else None,
+                data_sampler=self.rollout_sampler,
+                epoch=outer_step,
+            )
         if hasattr(collect_progress, "close"):
             collect_progress.close()
         rollout_seconds = time() - rollout_start
@@ -466,8 +390,7 @@ class OnPolicyTrainer:
         return global_stats, step_dir
 
     def update(self, outer_step, step_dir):
-        prepare_fn = None if self.encoder.freeze else self.encoder.prepare_row
-        buffer_dataset = RolloutBuffer(step_dir, prepare_fn=prepare_fn)
+        buffer_dataset = RolloutBuffer(step_dir)
         update_batch_size = min(self.local_batch_size, len(buffer_dataset))
         self.log_rollout_samples(buffer_dataset, outer_step)
         if rank_is_zero():
@@ -497,18 +420,18 @@ class OnPolicyTrainer:
         running = {key: 0.0 for key in ("loss", "grad_norm")}
         log_steps = 0
         log_start = time()
-        self.encoder.train()
+        self.model.net.train()
         batches = exact_update_batches(buffer_loader, buffer_sampler, self.updates_per_rollout)
         for batch in progress_bar(batches, total=self.updates_per_rollout, desc=f"updates {outer_step:06d}"):
             self.opt.zero_grad()
-            loss, step_stats = self.compute_loss(batch)
+            loss = self.model.rollout_loss(batch)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.params, self.grad_clip)
             grad_norm_avg = all_reduce_scalar(float(grad_norm.item()), self.device) / self.world_size
             self.opt.step()
             update_ema(self.ema, unwrap_model(self.model.net), decay=self.ema_decay)
 
-            running["loss"] += step_stats["loss"]
+            running["loss"] += float(loss.item())
             running["grad_norm"] += float(grad_norm_avg)
             log_steps += 1
             self.train_steps += 1
@@ -542,18 +465,6 @@ class OnPolicyTrainer:
 
             if self.train_steps >= self.total_steps:
                 break
-
-    def compute_loss(self, batch):
-        x_latent = batch["x_latent"].to(self.device, non_blocking=True)
-        if self.encoder.freeze:
-            context_tokens = batch["context_tokens"].to(self.device, non_blocking=True)
-            context_mask = batch["context_mask"].to(self.device, non_blocking=True)
-        else:
-            # Forward the tokenized (once) rollout contexts so gradients reach the encoder
-            # and the context tracks its current weights, not rollout-time snapshots.
-            context_tokens, context_mask = self.encoder.forward(batch["context_inputs"])
-        loss = diffusion_loss(self.model.net, self.model.diffusion, x_latent, context_tokens, context_mask)
-        return loss, {"loss": float(loss.item())}
 
     def log_rollout_samples(self, buffer_dataset, outer_step):
         if not rank_is_zero():
@@ -592,34 +503,26 @@ class OnPolicyTrainer:
 
     @torch.no_grad()
     def eval_step(self):
-        from algorithms.eval import adaptive_rollout, distance_metrics
+        from algorithms.eval import adaptive_eval, distance_metrics
 
         if not rank_is_zero() or self.val_dataset is None or len(self.val_dataset) == 0:
             return 0
-        self.encoder.eval()
         start_idx = int(self.eval_cfg.caption_index)
         batch_size = max(1, int(self.eval_cfg.batch_size))
         indices = [(start_idx + offset) % len(self.val_dataset) for offset in range(batch_size)]
-        items = [self.val_dataset[idx] for idx in indices]
-        batch = context_collate(items)
-        batch["context_tokens"], batch["context_mask"] = self.encoder.encode_history(
-            batch["caption"], [[] for _ in batch["caption"]], [[] for _ in batch["caption"]]
-        )
+        captions = [self.val_dataset[idx]["caption"] for idx in indices]
         gt_images = [self.val_dataset.image_for_index(idx) for idx in indices]
 
-        traces, histories, eval_tokens = adaptive_rollout(
-            self.ema,
-            self.model.vae,
-            self.policy_sampler,
+        traces, histories, eval_tokens = adaptive_eval(
+            self.model,
             self.verifier,
-            self.encoder,
-            batch,
+            captions,
             gt_images,
             steps=max(1, int(self.eval_cfg.steps)),
             seed=int(self.eval_cfg.seed) + self.train_steps * 1000,
             scorer=self.scorer,
+            sampler_cfg=self.sampler_cfg,
         )
-        self.encoder.train()
 
         trace_dir = self.log_dir / "adaptive_eval"
         trace_images = []
@@ -635,7 +538,7 @@ class OnPolicyTrainer:
                 feedback_text,
                 traces[batch_idx][-1]["image"],
             )
-            trace_images.append(wandb.Image(str(grid_path), caption=batch["caption"][batch_idx]))
+            trace_images.append(wandb.Image(str(grid_path), caption=captions[batch_idx]))
         metrics = {"eval/adaptive_traces": trace_images}
         for key, value in distance_metrics(traces).items():
             metrics[f"eval/{key}"] = value
