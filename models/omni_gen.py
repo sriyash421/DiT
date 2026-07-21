@@ -269,6 +269,7 @@ class OmniGenModel:
         for param in self.vae.parameters():
             param.requires_grad = False
         self._rollout_collator = None
+        self._gen_collator = None
 
     def load(self, path, use_ema=False):
         from algorithms.utils import load_checkpoint
@@ -338,31 +339,78 @@ class OmniGenModel:
         return self.loss(self._rollout_collator(features))
 
     @torch.no_grad()
-    def generate(self, batch, num_sampling_steps, cfg_scale=2.5, ddim_eta=0.0, seed=None):
-        from OmniGen import OmniGenPipeline
+    def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None):
+        """Single-forward (no-CFG) sampling: run the same model.forward used in training through the
+        OmniGen scheduler with one conditional pass per image. Bypasses OmniGenPipeline, which always
+        computes a wasted unconditional pass at cfg_scale=1.0 (2x-3x the compute). cfg_scale/ddim_eta
+        are ignored (no classifier-free guidance)."""
+        from OmniGen.processor import OmniGenCollator
+        from OmniGen.scheduler import OmniGenScheduler
+        from OmniGen.utils import vae_encode
 
         from algorithms.utils import unwrap_model
 
-        pipeline = OmniGenPipeline(vae=self.vae, model=unwrap_model(self.net), processor=self.processor, device=self.device)
+        module = unwrap_model(self.net)
+        if self._gen_collator is None:
+            self._gen_collator = OmniGenCollator(
+                pad_token_id=self.processor.text_tokenizer.eos_token_id,
+                hidden_size=module.llm.config.hidden_size,
+            )
         captions = batch["caption"]
         feedback_histories = batch.get("feedback_history", [[] for _ in captions])
-        attempt_paths = batch.get("attempt_paths", [[] for _ in captions])
-        prompts = [history_instruction(caption, history) for caption, history in zip(captions, feedback_histories)]
-        input_images = [list(paths) for paths in attempt_paths]
-        # Within a rollout step every active item shares the same history length, so image
-        # guidance is all-or-nothing. The OmniGen pipeline takes image PATHS (already on disk).
-        use_img_guidance = any(paths for paths in input_images)
-        images = pipeline(
-            prompt=prompts,
-            input_images=input_images if use_img_guidance else None,
-            height=self.image_height,
-            width=self.image_width,
-            num_inference_steps=num_sampling_steps,
-            guidance_scale=cfg_scale,
-            use_img_guidance=use_img_guidance,
-            seed=seed,
+        attempt_images = batch.get("attempt_images", [[] for _ in captions])
+        mllm_inputs = []
+        for caption, history, images in zip(captions, feedback_histories, attempt_images):
+            instruction = history_instruction(caption, history)
+            input_images = [self.transform(image) for image in images] or None
+            mllm_inputs.append(self.processor.process_multi_modal_prompt(instruction, input_images))
+
+        target_size = [[self.image_height, self.image_width] for _ in captions]
+        input_ids, position_ids, attention_mask, padding_images, pixel_values, image_sizes = (
+            self._gen_collator.process_mllm_input(mllm_inputs, target_size)
         )
-        return images
+        if pixel_values:
+            pixel_values = torch.cat(pixel_values, dim=0)
+            input_img_latents = vae_encode(self.vae, pixel_values.to(self.device), self.weight_dtype)
+        else:
+            input_img_latents = None
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        latents = torch.randn(
+            len(captions), 4, self.image_height // 8, self.image_width // 8,
+            device=self.device, dtype=self.weight_dtype, generator=generator,
+        )
+        model_kwargs = move_to_device({
+            "input_ids": input_ids,
+            "input_img_latents": input_img_latents,
+            "input_image_sizes": image_sizes,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "padding_latent": padding_images,
+        }, self.device)
+
+        scheduler = OmniGenScheduler(num_steps=int(num_sampling_steps))
+        # __init__ disables the LLM KV cache for training; generation needs it (the scheduler crops
+        # conditioning tokens after step 0, expecting them cached). forward_with_cfg does the same.
+        module.llm.config.use_cache = True
+        try:
+            samples = scheduler(latents, module.forward, model_kwargs, use_kv_cache=True, offload_kv_cache=False)
+        finally:
+            module.llm.config.use_cache = False
+
+        samples = samples.to(torch.float32)
+        if self.vae.config.shift_factor is not None:
+            samples = samples / self.vae.config.scaling_factor + self.vae.config.shift_factor
+        else:
+            samples = samples / self.vae.config.scaling_factor
+        samples = self.vae.decode(samples).sample
+        samples = (samples * 0.5 + 0.5).clamp(0, 1)
+        from PIL import Image as PILImage
+
+        samples = (samples * 255).to("cpu", dtype=torch.uint8).permute(0, 2, 3, 1).numpy()
+        return [PILImage.fromarray(sample) for sample in samples]
 
     def ddp(self, device):
         from torch.nn.parallel import DistributedDataParallel as DDP

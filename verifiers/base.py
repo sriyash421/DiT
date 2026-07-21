@@ -103,6 +103,55 @@ def build_distance_prompt(caption):
         "If everything matches, output exactly: none."
     )
 
+# def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
+#     past_feedback = [str(item).strip() for item in (feedback_history or ()) if str(item).strip()]
+#     if past_feedback:
+#         history_block = "Previous feedback already given:\n" + "\n".join(
+#             f"- {item}" for item in past_feedback
+#         ) + "\n\n"
+#         command_line = (
+#             "Write one short new command to fix image 2. "
+#             "Do not repeat a previous command unless that exact issue is still the clearest remaining error. "
+#         )
+#     else:
+#         history_block = ""
+#         command_line = "Write one short command to fix image 2. "
+#     prompt = (
+#         "Give feedback for a CLEVR image generator. "
+#         "You are shown the generated image; the caption is the only source of ground truth.\n"
+#         f"Caption: {caption}\n\n"
+#         "The caption has three parts. 'objects:' lists each object as <size> <color> <material> <shape> "
+#         "(size: small/large; material: metal/rubber; shape: sphere/cube/cylinder). "
+#         "'horizontal:' gives left-to-right order using 'is right of'. "
+#         "'depth:' gives front-to-back order using 'is behind'. "
+#         "Refer to an object by its color and shape (e.g. 'yellow sphere').\n\n"
+#         f"{history_block}"
+#         f"{command_line}"
+#         "Use this priority: missing/extra object > shape ~ color ~ size > horizontal position ~ depth > material. "
+#         "Mention one object and one edit only. Do not use and. Do not explain. "
+#         "If the generated image already follows the caption, return exactly: no update. "
+#         "Return only the command, under 15 words."
+#     )
+#     if enable_thinking:
+#         prompt += " If you reason, end with exactly: FINAL: <command under 15 words>."
+#     return prompt
+
+# def build_distance_prompt(caption):
+#     return (
+#         "Check a generated CLEVR image against a caption.\n"
+#         f"Caption: {caption}\n\n"
+#         "The caption has three parts. 'objects:' lists each object as <size> <color> <material> <shape> "
+#         "(size: small/large; material: metal/rubber; shape: sphere/cube/cylinder). "
+#         "'horizontal:' gives the left-to-right order using 'is right of'. "
+#         "'depth:' gives the front-to-back order using 'is behind'. "
+#         "Compare the generated image to the caption and list everything that does NOT match: "
+#         "any object with a wrong size, color, material, or shape; a wrong horizontal (left-to-right) order; "
+#         "a wrong depth (front-to-back) order; and any missing or extra object. "
+#         "Refer to an object by its color and shape (e.g. 'yellow sphere'). "
+#         "Output only the list, one mismatch per line, each line starting with '- '. No preamble. "
+#         "If everything matches, output exactly: none."
+#     )
+
 
 def parse_mismatch_list(text):
     """Distance = number of caption mismatches the VLM listed. 'none' (or empty) -> 0."""

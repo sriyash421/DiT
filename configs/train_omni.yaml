@@ -51,17 +51,17 @@ trainer:
   log_every: 100
   ckpt_every: 5000
   dataloader:
-    num_workers: 4
+    num_workers: 8
     pin_memory: true
     persistent_workers: true
-    prefetch_factor: 2
+    prefetch_factor: 4
     drop_last: true
   eval:
     split: val
     batch_size: 32
-    max_batches_per_dataset: 8
+    max_batches_per_dataset: 16
     dataloader:
-      num_workers: 2
+      num_workers: 4
       pin_memory: true
       persistent_workers: false
       prefetch_factor: 2

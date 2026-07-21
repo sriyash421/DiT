@@ -8,12 +8,12 @@ hydra:
     chdir: false
 
 verifier:
-  api_url: http://g3104:8000/v1
-  workers: 128
+  api_url: http://g3114:8000/v1
+  workers: 50
 
 ckpt: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_lora_finetune/checkpoints/0010000.pt
 results_dir: /gscratch/scrubbed/sriyash/omni-clevr-on-policy
-experiment_name: on_policy_omni_l4_initial_run
+experiment_name: on_policy_omni_l4_final
 
 dataset:
   image_size: 256
@@ -54,7 +54,7 @@ trainer:
     load_context: false
   sampler:
     type: ddim
-    num_sampling_steps: 100
+    num_sampling_steps: 25
     cfg_scale: 1.0
     ddim_eta: 0.0
   rollout:
@@ -63,12 +63,12 @@ trainer:
     use_ema: true
     storage_dir: null
     log_samples: 8
-    batch_size: 128
+    batch_size: 256
   lr: 1e-5
   weight_decay: 0.0
   global_batch_size: 32
   global_seed: 0
-  updates_per_rollout: 1000
+  updates_per_rollout: 200
   max_train_steps: 50000
   grad_clip: 1.0
   ema_decay: 0.99
@@ -81,7 +81,7 @@ trainer:
     prefetch_factor: 4
     drop_last: true
   eval:
-    caption_index: 20
+    caption_index: 42
     batch_size: 8
     seed: 0
     steps: 4
