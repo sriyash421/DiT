@@ -167,6 +167,8 @@ def generate_missing_images(args, index, generation_tasks, device):
 
 
 def build_dataset_verifier(args, device):
+    if args.vlm == "compbench":
+        return build_verifier("compbench-feedback", device=device)
     if args.vlm == "gemini":
         return build_verifier(
             "open-router",
@@ -277,7 +279,7 @@ def main():
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generation-batch-size", type=int, default=16)
     parser.add_argument("--image-save-workers", type=int, default=8)
-    parser.add_argument("--vlm", choices=["gemini", "qwen-local", "qwen-vllm"], default="gemini")
+    parser.add_argument("--vlm", choices=["gemini", "qwen-local", "qwen-vllm", "compbench"], default="gemini")
     parser.add_argument("--vlm-temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--enable-thinking", action="store_true")

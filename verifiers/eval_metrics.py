@@ -4,7 +4,12 @@ from verifiers.open_router import OpenRouterVerifier
 EVAL_MODEL = "google/gemini-3.1-flash-lite"
 
 
-def make_scorer(workers=16, max_tokens=256, timeout=120):
+def make_scorer(workers=16, max_tokens=1024, timeout=120, backend="vlm", **compbench_kwargs):
+    """Build the eval scorer. backend='vlm' -> Gemini caption-mismatch distance; backend='compbench'
+    -> the CompBenchEval faithfulness metric wrapped as a distance scorer (1 - faithfulness)."""
+    if backend == "compbench":
+        from verifiers.compbench import CompBenchFeedbackVerifier
+        return CompBenchFeedbackVerifier(**compbench_kwargs)
     # max_tokens is generous: the distance prompt returns a bulleted list of mismatches, not a single int.
     return OpenRouterVerifier(model=EVAL_MODEL, temperature=0.0, max_tokens=max_tokens, workers=workers, timeout=timeout)
 

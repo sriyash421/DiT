@@ -93,6 +93,47 @@ def run_checkpoint_eval(model, eval_datasets, eval_names, eval_cfg, device, logg
             encoder.train()
 
 
+@torch.no_grad()
+def run_compbench_eval(model, scorer, eval_dataset, eval_cfg, device, logger, train_steps, log_dir):
+    """Generate images for eval prompts and score them with CompBenchEval faithfulness (higher =
+    better). Used instead of validation loss when the GT images are placeholders (CompBench). Runs on
+    rank 0 only; `model.generate` uses the unwrapped net, so it needs no cross-rank collectives."""
+    if not rank_is_zero():
+        return
+    count = min(int(getattr(eval_cfg, "count", eval_cfg.batch_size)), len(eval_dataset))
+    if count == 0:
+        return
+    rng = random.Random(int(getattr(eval_cfg, "seed", 0)) + train_steps)
+    indices = rng.sample(range(len(eval_dataset)), count)
+    captions = [eval_dataset[idx]["caption"] for idx in indices]
+    categories = [eval_dataset[idx]["tuple_id"] for idx in indices]
+
+    net = model.net
+    was_training = net.training
+    net.eval()
+    preds = model.generate(
+        {"caption": captions},
+        num_sampling_steps=int(getattr(eval_cfg, "num_sampling_steps", 50)),
+        cfg_scale=float(getattr(eval_cfg, "cfg_scale", 1.0)),
+        ddim_eta=float(getattr(eval_cfg, "ddim_eta", 0.0)),
+        seed=int(getattr(eval_cfg, "seed", 0)) + train_steps,
+    )
+    if was_training:
+        net.train()
+
+    scores = scorer.score(captions, preds, categories)
+    by_category = {}
+    for category, value in zip(categories, scores):
+        by_category.setdefault(category or "complex", []).append(value)
+    metrics = {"eval_compbench/score": sum(scores) / len(scores)}
+    for category, values in by_category.items():
+        metrics[f"eval_compbench/score_{category}"] = sum(values) / len(values)
+    wandb.log(metrics, step=train_steps)
+    grid_path = Path(log_dir) / "compbench_eval" / f"step_{train_steps:07d}.png"
+    save_gt_pred_grid(grid_path, [eval_dataset.image_for_index(idx) for idx in indices], preds)
+    logger.info("CompBench eval: " + ", ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
+
+
 def select_eval_batch(dataset, seed, count):
     """Randomly pick rows and return their contexts, captions, and GT images.
 

@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 import wandb
-from algorithms.eval import build_eval_datasets, run_checkpoint_eval
+from algorithms.eval import build_eval_datasets, run_checkpoint_eval, run_compbench_eval
 from algorithms.utils import (
     build_optimizer_scheduler,
     create_logger,
@@ -62,6 +62,11 @@ class OfflineTrainer:
         self.log_every = int(log_every)
         self.ckpt_every = int(ckpt_every)
         self.eval_cfg = eval
+        self._eval_fn = None
+        if self.eval_cfg.get("use_compbench_scorer", False) and rank_is_zero():
+            from verifiers.compbench import CompBenchFeedbackVerifier
+            self._eval_fn = CompBenchFeedbackVerifier(device=self.device)
+
         self.train_steps = int(start_step)
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -184,6 +189,20 @@ class OfflineTrainer:
         self.logger.info("Done!")
 
     def eval_step(self):
+        if self.eval_cfg.get("use_compbench_scorer", False):
+            if not self.eval_datasets:
+                return
+            run_compbench_eval(
+                self.model,
+                self._eval_fn,
+                self.eval_datasets[0],
+                self.eval_cfg,
+                self.device,
+                self.logger,
+                self.train_steps,
+                self.log_dir,
+            )
+            return
         run_checkpoint_eval(
             self.model,
             self.eval_datasets,
