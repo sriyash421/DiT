@@ -18,19 +18,24 @@ from tqdm import tqdm
 import wandb
 from algorithms.eval import save_gt_pred_grid, select_eval_batch
 from algorithms.utils import write_json
-from verifiers.eval_metrics import make_scorer, score
+from verifiers.eval_metrics import score, scorer_from_eval_cfg
 
 
 def resolve_run(run_dir, step):
     """Resolve a run directory + step into (training config, full checkpoint path).
 
-    step=-1 picks the latest checkpoint. Checkpoints live at <run_dir>/checkpoints/<step:07d>.pt
+    step=-1 picks the latest checkpoint; step=0 means "no checkpoint" -> the untrained base model
+    (LoRA inits lora_B to zeros, so an unloaded adapter is exactly the pretrained backbone), which
+    gives a zero-training baseline. Checkpoints live at <run_dir>/checkpoints/<step:07d>.pt
     (the full checkpoint holding model/ema/context_encoder); the training config is <run_dir>/config.yaml.
     """
     run_dir = Path(run_dir)
     cfg_path = run_dir / "config.yaml"
     assert cfg_path.exists(), f"No training config at {cfg_path}; is {run_dir} a training run dir?"
     ckpt_dir = run_dir / "checkpoints"
+    if step == 0:
+        print(f"Run {run_dir.name}: config={cfg_path.name}, ckpt=<none> (base model, no training)")
+        return OmegaConf.load(cfg_path), None
     if step < 0:
         steps = sorted(int(p.stem) for p in ckpt_dir.glob("*.pt") if not p.stem.endswith("-ema"))
         assert steps, f"No checkpoints found in {ckpt_dir}."
@@ -63,7 +68,7 @@ def evaluate_split(args, model, dataset, split, scorer, out_dir):
         )
 
     grid_path = out_dir / f"{split}_gt_pred.png"
-    save_gt_pred_grid(grid_path, batch["gt_images"], predictions)
+    save_gt_pred_grid(grid_path, batch["gt_images"], predictions, captions=batch["caption"])
     distances = score(scorer, batch["caption"], batch["gt_images"], predictions)
     scored = [d for d in distances if d is not None]
     mean_distance = sum(scored) / len(scored) if scored else None
@@ -85,7 +90,8 @@ def evaluate_split(args, model, dataset, split, scorer, out_dir):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run_dir", required=True, help="Training run dir (holds config.yaml and checkpoints/).")
-    p.add_argument("--step", type=int, default=-1, help="Checkpoint step to load; -1 for the latest.")
+    p.add_argument("--step", type=int, default=-1,
+                   help="Checkpoint step to load; -1 for the latest, 0 for the untrained base model.")
     p.add_argument("--out_dir", default=None,
                    help="Output dir; defaults to results/eval_<run_dir name>_ckpt<step>/.")
     p.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True,
@@ -112,7 +118,8 @@ def main():
     args.ckpt = ckpt
 
     out_dir = Path(args.out_dir) if args.out_dir else (
-        Path("results") / f"eval_{Path(args.run_dir).name}_ckpt{Path(ckpt).stem}"
+        Path("results") / f"eval_{Path(args.run_dir).name}_ckpt"
+        f"{Path(ckpt).stem if ckpt else 'base'}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving results to {out_dir}")
@@ -120,9 +127,12 @@ def main():
 
     dataset = build_dataset(train_cfg.dataset.split)
     model = hydra.utils.instantiate(train_cfg.model, context_dim=dataset.context_dim, device=device)
-    model.load(ckpt, use_ema=args.use_ema)
+    if ckpt is not None:
+        model.load(ckpt, use_ema=args.use_ema)
+    else:
+        print("No checkpoint loaded: evaluating the base (untrained) model.")
     model.net.eval()
-    scorer = make_scorer()
+    scorer = scorer_from_eval_cfg(OmegaConf.select(train_cfg, "trainer.eval"))
 
     metrics = {}
     grids = {}

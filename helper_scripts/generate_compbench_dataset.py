@@ -113,15 +113,20 @@ def main(args):
                 pipe, prompt, args.n_candidates, args.gen_batch_size,
                 args.seed + idx * args.n_candidates, args.steps, args.guidance, args.gen_size,
             )
+            # Prompt-level atomic: save all images, then write all manifest lines at once. A
+            # preemption mid-prompt leaves no manifest lines, so the whole prompt is redone on requeue
+            # (never a half-set silently marked done).
+            lines = []
             for cand_idx, image in enumerate(candidates):
                 score = scorer.score_one(prompt, image, category)
                 path = images_dir / "train" / f"{category}_{idx:04d}_{cand_idx}.png"
                 save_atomic(image, path, args.save_size)
-                manifest.write(json.dumps({
+                lines.append(json.dumps({
                     "category": category, "split": "train", "prompt_index": idx,
                     "candidate_index": cand_idx, "image_path": str(path.relative_to(out)),
                     "prompt": prompt, "score": float(score),
-                }) + "\n")
+                }))
+            manifest.write("\n".join(lines) + "\n")
             manifest.flush()
 
 
@@ -131,7 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--categories", nargs="+", default=["color"], choices=CATEGORIES)
     parser.add_argument("--model", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--n-candidates", type=int, default=16)
-    parser.add_argument("--gen-batch-size", type=int, default=4)
+    parser.add_argument("--gen-batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--guidance", type=float, default=3.5)
     parser.add_argument("--gen-size", type=int, default=1024)

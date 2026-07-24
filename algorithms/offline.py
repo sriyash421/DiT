@@ -64,8 +64,8 @@ class OfflineTrainer:
         self.eval_cfg = eval
         self._eval_fn = None
         if self.eval_cfg.get("use_compbench_scorer", False) and rank_is_zero():
-            from verifiers.compbench import CompBenchFeedbackVerifier
-            self._eval_fn = CompBenchFeedbackVerifier(device=self.device)
+            from verifiers.compbench import CompBenchEval
+            self._eval_fn = CompBenchEval(device=self.device)
 
         self.train_steps = int(start_step)
         self.rank = dist.get_rank()

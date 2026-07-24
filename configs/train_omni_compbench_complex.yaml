@@ -1,5 +1,5 @@
 defaults:
-  - dataset: compbench_base
+  - dataset: compbench_complex
   - _self_
 
 hydra:
@@ -7,8 +7,8 @@ hydra:
     chdir: false
 
 ckpt: null
-results_dir: /gscratch/scrubbed/sriyash/OmniGen-compbench
-experiment_name: omni_lora_compbench
+results_dir: /gscratch/scrubbed/sriyash/OmniGen-compbench-complex
+experiment_name: omni_lora_compbench_complex
 
 dataset:
   image_size: 256
@@ -49,7 +49,7 @@ trainer:
   grad_clip: 1.0
   ema_decay: 0.0
   log_every: 100
-  ckpt_every: 5000
+  ckpt_every: 2000
   dataloader:
     num_workers: 8
     pin_memory: true

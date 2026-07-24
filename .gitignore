@@ -97,3 +97,4 @@ data
 scripts/adaptive_debug
 .venv
 .venv-omni
+debug/

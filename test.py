@@ -48,8 +48,10 @@ from verifiers.base import (
     build_distance_prompt,
     build_feedback_prompt,
     clean_feedback_text,
+    levenshtein,
     normalize_chat_url,
-    parse_mismatch_list,
+    parse_caption_gt,
+    score_structured_distance,
 )
 from verifiers.gemini import DEFAULT_GEMINI_MODEL, GeminiVerifier
 from verifiers.open_router import OpenRouterVerifier
@@ -551,7 +553,9 @@ def test_pad_contexts_shapes_and_mask():
 def test_feedback_prompt_mentions_priority_and_word_limit():
     prompt = build_feedback_prompt("a red cube")
     assert "Caption: a red cube" in prompt
-    assert "missing/extra object > shape > color > size > material > position/depth > background" in prompt
+    assert "missing/extra object > blurry object > shape > color > position/depth" in prompt
+    assert "blurry" in prompt and "clearly wrong" in prompt
+    assert "Do not give feedback about size or material" in prompt
     assert "under 12 words" in prompt
     assert "return exactly: no update" in prompt
     assert "Previous feedback already given:" not in prompt
@@ -566,24 +570,45 @@ def test_feedback_prompt_with_history_includes_past_feedback():
     assert "return exactly: no update" in prompt
 
 
-def test_distance_prompt_lists_caption_mismatches():
-    prompt = build_distance_prompt("a red cube")
-    assert "Caption: a red cube" in prompt
-    assert "horizontal" in prompt and "depth" in prompt
-    assert "one mismatch per line" in prompt
-    # Caption-grounded, no GT-image references.
-    assert "Ground-truth" not in prompt and "image 1" not in prompt.lower()
+_CAP = ("objects: small red metal cube, large blue rubber sphere. "
+        "horizontal: red cube, blue sphere. depth: blue sphere, red cube.")
 
 
-def test_parse_mismatch_list_counts_lines():
-    assert parse_mismatch_list("none") == 0.0
-    assert parse_mismatch_list("") == 0.0
-    assert parse_mismatch_list("- wrong color of cube\n- missing sphere") == 2.0
-    assert parse_mismatch_list("- one\n- two\n- three") == 3.0
-    # Preamble line without a bullet is ignored when bullets are present.
-    assert parse_mismatch_list("Mismatches:\n- a\n- b") == 2.0
-    # No bullets: count non-empty, non-'none' lines.
-    assert parse_mismatch_list("wrong cube color") == 1.0
+def test_parse_caption_gt_recovers_objects_and_orderings():
+    objects, gt_lr, gt_fb = parse_caption_gt(_CAP)
+    assert [o["shape"] for o in objects] == ["cube", "sphere"]
+    assert gt_lr == [1, 2] and gt_fb == [2, 1]  # 1-based scene indices
+    # Single-object captions have no orderings.
+    assert parse_caption_gt("objects: small red metal cube.") == (
+        [{"size": "small", "color": "red", "material": "metal", "shape": "cube"}], [], [])
+
+
+def test_distance_prompt_is_structured_json():
+    prompt = build_distance_prompt(_CAP)
+    assert "1. small red metal cube" in prompt and "2. large blue rubber sphere" in prompt
+    assert '"present"' in prompt and '"shape_ok"' in prompt and '"color_ok"' in prompt
+    # size and material are no longer scored.
+    assert "size_ok" not in prompt and "material_ok" not in prompt
+    assert "left_to_right" in prompt and "front_to_back" in prompt
+
+
+def test_levenshtein():
+    assert levenshtein([1, 2, 3], [1, 2, 3]) == 0
+    assert levenshtein([1, 2, 3], [3, 2, 1]) == 2
+
+
+def test_score_structured_distance_is_reward_higher_better():
+    ok = '{"objects":[{"present":true,"shape_ok":true,"color_ok":true},' \
+         '{"present":true,"shape_ok":true,"color_ok":true}],' \
+         '"left_to_right":[1,2],"front_to_back":[2,1]}'
+    assert score_structured_distance(ok, _CAP) == 0.0  # perfect match
+    # One object missing -> content = 0.5, order filtered away -> distance 0.35, reward -0.35.
+    miss = '{"objects":[{"present":true,"shape_ok":true,"color_ok":true},' \
+           '{"present":false}],"left_to_right":[1],"front_to_back":[1]}'
+    assert abs(score_structured_distance(miss, _CAP) - (-0.35)) < 1e-9
+    # Malformed / wrong-length JSON -> None so the caller marks the row failed.
+    assert score_structured_distance("not json at all", _CAP) is None
+    assert score_structured_distance('{"objects":[]}', _CAP) is None
 
 
 def test_clean_feedback_text():

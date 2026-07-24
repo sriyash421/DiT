@@ -263,9 +263,9 @@ class CompBenchEval:
 
 
 class CompBenchFeedbackVerifier(FeedbackVerifier):
-    """VLM-free CompBench verifier: BLIP-VQA gives the lowest-prob phrase as feedback, and
-    1 - faithfulness as distance. Drop-in for the hosted-VLM verifier in the CompBench feedback and
-    eval paths — no chat endpoint, only the local BLIP/CLIP metric models.
+    """VLM-free CompBench verifier: BLIP-VQA gives the lowest-prob phrase as feedback, and the
+    faithfulness score (higher = better) as the reward. Drop-in for the hosted-VLM verifier in the
+    CompBench feedback and eval paths — no chat endpoint, only the local BLIP/CLIP metric models.
     """
 
     workers = 1
@@ -281,5 +281,5 @@ class CompBenchFeedbackVerifier(FeedbackVerifier):
 
     def _distance_row(self, caption, gt_image, attempt_image):
         return VerificationResult(
-            ok=True, score=1.0 - float(self.eval.score_one(caption, attempt_image, self.category))
+            ok=True, score=float(self.eval.score_one(caption, attempt_image, self.category))
         )

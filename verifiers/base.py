@@ -2,11 +2,17 @@
 import base64
 import concurrent.futures
 import io
+import json
 import re
 import time
 from dataclasses import dataclass, field
 
 from PIL import Image
+
+
+# When False, the structured distance prompt/score AND the feedback grammar ignore object ordering
+# (left-to-right / front-to-back) and consider only presence, shape, color, and extra/missing objects.
+USE_ORDER = False
 
 
 @dataclass
@@ -75,13 +81,29 @@ def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
     else:
         history_block = ""
         command_line = "Write one short command to fix image 2. "
+    order_form = (
+        " or 'swap positions of <object A> and <object B>' when two objects are in the wrong order"
+        if USE_ORDER else ""
+    )
+    order_priority = " > position/depth" if USE_ORDER else ""
     prompt = (
         "Give feedback for a CLEVR image generator. "
         "You are shown the generated image; the caption is the only source of truth.\n"
         f"Caption: {caption}\n\n"
         f"{history_block}"
         f"{command_line}"
-        "Use this priority: missing/extra object > shape > color > size > material > position/depth > background. "
+        "Use exactly one of these forms: "
+        "'fix <object>' when an object is blurry or malformed, "
+        "'replace <wrong object> with <object>' when a wrong object appears instead of an expected one, "
+        "'add <object>' when an expected object is missing, "
+        "'fix shape of <object> to <shape>', "
+        "'change color of <object> to <color>'"
+        f"{order_form}. "
+        "Do not give feedback about size or material. "
+        "Use this priority: missing or wrong object > shape > color > extra object"
+        f"{order_priority} > blurry object. "
+        "Only give 'fix <object>' for a blurry object when every expected object is already present "
+        "with the correct shape and color. "
         "Mention one object and one edit only. Do not use and. Do not explain. "
         "If the generated image already follows the caption, return exactly: no update. "
         "Return only the command, under 12 words."
@@ -91,85 +113,228 @@ def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
     return prompt
 
 
+def parse_caption_gt(caption):
+    """Recover the GT from a rendered CLEVR caption: the objects in scene order, and the left-to-right
+    and front-to-back orderings as 1-based scene indices. Orderings are empty for single-object scenes.
+    Returns (objects, gt_left_to_right, gt_front_to_back)."""
+    from datasets.clevr.utils import unique_labels
+
+    obj_match = re.search(r"objects:\s*(.*?)\.", caption)
+    objects = []
+    for descr in (obj_match.group(1).split(",") if obj_match else []):
+        parts = descr.split()
+        if len(parts) == 4:  # full_description == "<size> <color> <material> <shape>"
+            objects.append({"size": parts[0], "color": parts[1], "material": parts[2], "shape": parts[3]})
+    if not objects:
+        return [], [], []
+
+    labels = unique_labels(objects)
+
+    def order_indices(name):
+        match = re.search(rf"{name}:\s*(.*?)\.", caption)
+        if not match:
+            return []
+        return [labels.index(lbl.strip()) + 1 for lbl in match.group(1).split(",") if lbl.strip() in labels]
+
+    return objects, order_indices("horizontal"), order_indices("depth")
+
+
 def build_distance_prompt(caption):
+    """Structured BLIP-VQA-style check: list the GT objects and ask for per-object per-attribute
+    presence plus the two orderings, as strict JSON. Scoring happens in code (score_structured_distance)."""
+    objects, _, _ = parse_caption_gt(caption)
+    listing = "\n".join(
+        f"{i + 1}. {o['size']} {o['color']} {o['material']} {o['shape']}" for i, o in enumerate(objects)
+    )
+    order = USE_ORDER and len(objects) > 1
+    fields = (
+        '{"objects": [{"present": <bool>, "shape_ok": <bool>, "color_ok": <bool>, "malformed": <bool>}, '
+        '... one entry per numbered object above]'
+    )
+    if order:
+        fields += (
+            ', "left_to_right": [object numbers, left to right, present ones only], '
+            '"front_to_back": [object numbers, front (closest) to back, present ones only]'
+        )
+    fields += ', "extra_objects": ["<color> <shape> for any object in the image NOT in the list above"]'
+    fields += "}"
     return (
-        "Check a generated CLEVR image against a caption.\n"
-        f"Caption: {caption}\n\n"
-        "The caption lists the objects (each with size, color, material, shape), their left-to-right "
-        "(horizontal) order, and their front-to-back (depth) order. Compare the generated image to the "
-        "caption and list everything that does NOT match: any object with a wrong size, color, material, "
-        "or shape; a wrong horizontal order; a wrong depth order; and any missing or extra object. "
-        "Output only the list, one mismatch per line, each line starting with '- '. No preamble. "
-        "If everything matches, output exactly: none."
+        "You are shown one generated CLEVR image. It should contain these objects:\n"
+        f"{listing}\n\n"
+        "Judge the generated image against this list. For each numbered object report whether it is "
+        "present, whether its shape and color match (shape_ok/color_ok), and whether it is blurry or "
+        "malformed (malformed). "
+        + ("Also give the left-to-right and front-to-back order of the present objects by their numbers. "
+           if order else "")
+        + "In extra_objects, list any object visible in the image that is NOT one of the expected "
+        "objects above (empty list if none). "
+        + "Reply with ONLY this JSON, no prose or code fences:\n"
+        + fields
     )
 
-# def build_feedback_prompt(caption, feedback_history=(), enable_thinking=False):
-#     past_feedback = [str(item).strip() for item in (feedback_history or ()) if str(item).strip()]
-#     if past_feedback:
-#         history_block = "Previous feedback already given:\n" + "\n".join(
-#             f"- {item}" for item in past_feedback
-#         ) + "\n\n"
-#         command_line = (
-#             "Write one short new command to fix image 2. "
-#             "Do not repeat a previous command unless that exact issue is still the clearest remaining error. "
-#         )
-#     else:
-#         history_block = ""
-#         command_line = "Write one short command to fix image 2. "
-#     prompt = (
-#         "Give feedback for a CLEVR image generator. "
-#         "You are shown the generated image; the caption is the only source of ground truth.\n"
-#         f"Caption: {caption}\n\n"
-#         "The caption has three parts. 'objects:' lists each object as <size> <color> <material> <shape> "
-#         "(size: small/large; material: metal/rubber; shape: sphere/cube/cylinder). "
-#         "'horizontal:' gives left-to-right order using 'is right of'. "
-#         "'depth:' gives front-to-back order using 'is behind'. "
-#         "Refer to an object by its color and shape (e.g. 'yellow sphere').\n\n"
-#         f"{history_block}"
-#         f"{command_line}"
-#         "Use this priority: missing/extra object > shape ~ color ~ size > horizontal position ~ depth > material. "
-#         "Mention one object and one edit only. Do not use and. Do not explain. "
-#         "If the generated image already follows the caption, return exactly: no update. "
-#         "Return only the command, under 15 words."
-#     )
-#     if enable_thinking:
-#         prompt += " If you reason, end with exactly: FINAL: <command under 15 words>."
-#     return prompt
 
-# def build_distance_prompt(caption):
-#     return (
-#         "Check a generated CLEVR image against a caption.\n"
-#         f"Caption: {caption}\n\n"
-#         "The caption has three parts. 'objects:' lists each object as <size> <color> <material> <shape> "
-#         "(size: small/large; material: metal/rubber; shape: sphere/cube/cylinder). "
-#         "'horizontal:' gives the left-to-right order using 'is right of'. "
-#         "'depth:' gives the front-to-back order using 'is behind'. "
-#         "Compare the generated image to the caption and list everything that does NOT match: "
-#         "any object with a wrong size, color, material, or shape; a wrong horizontal (left-to-right) order; "
-#         "a wrong depth (front-to-back) order; and any missing or extra object. "
-#         "Refer to an object by its color and shape (e.g. 'yellow sphere'). "
-#         "Output only the list, one mismatch per line, each line starting with '- '. No preamble. "
-#         "If everything matches, output exactly: none."
-#     )
-
-
-def parse_mismatch_list(text):
-    """Distance = number of caption mismatches the VLM listed. 'none' (or empty) -> 0."""
+def _extract_json(text):
     text = str(text).strip()
-    if not text or text.lower().rstrip(".") in ("none", "no mismatches", "everything matches"):
-        return 0.0
-    bullet_lines = [
-        line for line in text.splitlines()
-        if line.strip().startswith(("-", "*", "•")) or re.match(r"^\s*\d+[.)]", line)
-    ]
-    if bullet_lines:
-        return float(len(bullet_lines))
-    # No bullets: count non-empty lines that aren't a "none"-style answer.
-    lines = [
-        line for line in text.splitlines()
-        if line.strip() and line.strip().lower().rstrip(".") not in ("none", "no mismatches", "everything matches")
-    ]
-    return float(len(lines))
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _as_int_list(value):
+    out = []
+    for item in value if isinstance(value, list) else []:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def levenshtein(a, b):
+    """Sequence edit distance between two lists of object indices."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+# Higher (less negative) is better. Content dominates order (0.7 vs 0.3); within content, attribute
+# severity is shape > color (size and material are too noisy to score). See parse_caption_gt for the
+# GT the VLM is judged against.
+_ATTR_WEIGHTS = {"shape_ok": 0.6, "color_ok": 0.4}
+
+
+def score_structured_breakdown(text, caption):
+    """Decompose the VLM's structured JSON report into per-metric rewards (higher = better, each <= 0).
+    Returns None if the caption or JSON can't be parsed. Keys: combined (the final distance reward) plus
+    the sub-metrics presence/shape/color/lr/fb and their content/order aggregates."""
+    objects, gt_lr, gt_fb = parse_caption_gt(caption)
+    n = len(objects)
+    if n == 0:
+        return None
+    data = _extract_json(text)
+    if data is None:
+        return None
+    reports = data.get("objects")
+    if not isinstance(reports, list) or len(reports) != n or not all(isinstance(r, dict) for r in reports):
+        return None
+
+    penalties = []
+    present = []
+    shape_bad = color_bad = absent = 0
+    for i, report in enumerate(reports):
+        if not report.get("present", False):
+            absent += 1
+            penalties.append(1.0)
+            continue
+        present.append(i + 1)
+        shape_bad += not report.get("shape_ok", False)
+        color_bad += not report.get("color_ok", False)
+        penalties.append(sum(w for key, w in _ATTR_WEIGHTS.items() if not report.get(key, False)))
+    lr = fb = 0.0
+    if USE_ORDER and len(present) >= 2 and gt_lr and gt_fb:
+        present_set = set(present)
+        keep = lambda seq: [x for x in seq if x in present_set]
+        m = len(present)
+        lr = levenshtein(keep(gt_lr), keep(_as_int_list(data.get("left_to_right")))) / m
+        fb = levenshtein(keep(gt_fb), keep(_as_int_list(data.get("front_to_back")))) / m
+    order = 0.5 * lr + 0.5 * fb
+    p = max(len(present), 1)
+
+    extra_list = data.get("extra_objects")
+    n_extra = len(extra_list) if isinstance(extra_list, list) else 0
+    # Pair each extra object with a missing expected one: that pair is a single substitution ("replace
+    # the extra with the correct object"), already counted once via the missing object's 1.0 penalty.
+    # Only genuinely surplus extras are charged separately, so an extra+missing pair is not double-counted.
+    leftover_extra = max(0, n_extra - absent)
+    denom = n + leftover_extra
+    object_distance = (sum(penalties) + leftover_extra) / denom if denom else 0.0
+
+    if USE_ORDER:
+        combined = -(0.7 * object_distance + 0.3 * order)
+    else:
+        combined = -object_distance
+
+    return {
+        "combined": combined,
+        "content": -object_distance,       # missing + wrong-shape/color + surplus-extra, substitution-paired
+        "order": -order,
+        "presence": -(absent / n),         # fraction of GT objects missing (raw, before pairing)
+        "shape": -(shape_bad / p),         # shape errors among present objects
+        "color": -(color_bad / p),         # color errors among present objects
+        "extra": -(leftover_extra / denom) if denom else 0.0,  # surplus extras after substitution pairing
+        "lr": -lr,                         # normalized left-to-right order edit distance
+        "fb": -fb,                         # normalized front-to-back order edit distance
+    }
+
+
+def score_structured_distance(text, caption):
+    """The final distance reward in [-1, 0] (0 = perfect). Returns None if the caption or JSON can't be
+    parsed, so the caller can mark the row failed."""
+    breakdown = score_structured_breakdown(text, caption)
+    return None if breakdown is None else breakdown["combined"]
+
+
+def build_text_feedback(caption, vlm_json):
+    """v2 feedback: turn the structured distance JSON into ONE one-object/one-edit command, in code.
+    Priority: replace/add (wrong or missing object) -> shape -> color -> remove extra -> order (if
+    USE_ORDER) -> blurry (LAST, only once the scene is otherwise correct). Referents come from the
+    caption, so they can't drift. Returns (command, rule)."""
+    from datasets.clevr.utils import unique_labels
+
+    objects, gt_lr, gt_fb = parse_caption_gt(caption)
+    reports = (vlm_json or {}).get("objects")
+    if not objects or not isinstance(reports, list) or len(reports) != len(objects):
+        return "no update", "match"
+    labels = unique_labels(objects)
+
+    def color_shape(i):
+        return f"{objects[i]['color']} {objects[i]['shape']}"
+
+    present = [i for i, r in enumerate(reports) if isinstance(r, dict) and r.get("present")]
+    missing = [i for i, r in enumerate(reports) if isinstance(r, dict) and not r.get("present")]
+    extra = [str(x).strip() for x in ((vlm_json or {}).get("extra_objects") or []) if str(x).strip()]
+
+    # 1. wrong object: an extra appears in place of a missing expected one -> replace (one substitution)
+    if extra and missing:
+        return f"replace the {extra[0]} with a {color_shape(missing[0])}", "extra-replace"
+    # 2. missing expected object
+    if missing:
+        return f"add a {color_shape(missing[0])}", "missing"
+    # 3. shape
+    for i in present:
+        if not reports[i].get("shape_ok", True):
+            return f"fix shape of the {objects[i]['color']} object to {objects[i]['shape']}", "shape"
+    # 4. color
+    for i in present:
+        if not reports[i].get("color_ok", True):
+            return f"change color of the {objects[i]['shape']} to {objects[i]['color']}", "color"
+    # 5. surplus extra object (no missing left to pair with) -> remove
+    if extra:
+        return f"remove the {extra[0]}", "extra-remove"
+    # 6. order (only when enabled)
+    if USE_ORDER and len(present) >= 2 and gt_lr and gt_fb:
+        ps = {i + 1 for i in present}
+        keep = lambda seq: [x for x in seq if x in ps]
+        for axis, gt, key in (("left-to-right", gt_lr, "left_to_right"), ("front-to-back", gt_fb, "front_to_back")):
+            gt_seq = keep(gt)
+            vlm_seq = keep(_as_int_list((vlm_json or {}).get(key)))
+            if gt_seq != vlm_seq:
+                for want, have in zip(gt_seq, vlm_seq):
+                    if want != have:
+                        return f"swap the {axis} positions of the {labels[have - 1]} and the {labels[want - 1]}", f"order-{axis}"
+    # 7. blurry / malformed -- LAST: only once every expected object is present with correct shape+color
+    for i in present:
+        if reports[i].get("malformed"):
+            return f"fix the {color_shape(i)}", "blurry"
+    return "no update", "match"
 
 
 def total_tokens_from_usage(usage):
@@ -256,12 +421,18 @@ class OpenAIChatVerifier(FeedbackVerifier):
         )
 
     def _distance_row(self, caption, gt_image, attempt_image):
-        # gt_image unused: mismatches are counted against the caption, not the GT image.
-        return self._post_prompt(
-            build_distance_prompt(caption),
-            attempt_image,
-            parse_feedback=False,
-        )
+        # gt_image unused: the structured check is judged against the caption, not the GT image.
+        result = self._post_prompt(build_distance_prompt(caption), attempt_image, parse_feedback=False)
+        if not result.ok:
+            return result
+        score = score_structured_distance(result.feedback, caption)
+        if score is None:
+            return VerificationResult(
+                ok=False, error="unparseable distance JSON",
+                token_count=result.token_count, token_usage=result.token_usage,
+            )
+        result.score = score
+        return result
 
     def _post_prompt(self, prompt, attempt_image, parse_feedback=True):
         import requests
@@ -290,13 +461,10 @@ class OpenAIChatVerifier(FeedbackVerifier):
                 feedback = clean_feedback_text(text) if parse_feedback else str(text).strip()
                 if not feedback and parse_feedback:
                     raise ValueError("empty feedback")
-                score = None
-                if not parse_feedback:
-                    score = parse_mismatch_list(feedback)
                 return VerificationResult(
                     ok=True,
                     feedback=feedback,
-                    score=score,
+                    score=None,
                     token_count=total_tokens_from_usage(usage),
                     token_usage=usage,
                 )

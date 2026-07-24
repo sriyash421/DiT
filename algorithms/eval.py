@@ -1,5 +1,6 @@
 """Evaluation helpers: validation loss, batch selection, and result grids."""
 import random
+import textwrap
 from pathlib import Path
 
 import torch
@@ -259,10 +260,9 @@ def distance_metrics(traces):
     for trace in traces:
         scores = [entry["distance"] for entry in trace if entry["distance"] is not None]
         if scores:
-            best_scores.append(min(scores))
+            best_scores.append(max(scores))  # scores are rewards now (higher = better)
     if best_scores:
         metrics["best_distance"] = sum(best_scores) / len(best_scores)
-        metrics["best_aligned_score"] = sum(1.0 / (1.0 + score) for score in best_scores) / len(best_scores)
     return metrics
 
 
@@ -364,15 +364,19 @@ def save_adaptive_trace_grid(path, traces, gt_images, captions, tile=160):
     return path
 
 
-def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=16):
-    """Save a grid of GT | prediction pairs, plotting at most `max_images` pairs."""
+def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=16, captions=None):
+    """Save a grid of GT | prediction pairs, plotting at most `max_images` pairs. When `captions` is
+    given, the caption is wrapped and drawn under each pair."""
     if max_images is not None:
         gt_images = gt_images[:max_images]
         pred_images = pred_images[:max_images]
+        captions = captions[:max_images] if captions is not None else None
     tile = 128
     pair_w = tile * 2
     label_h = 24
-    cell_h = tile + label_h
+    caption_lines = 3
+    caption_h = (caption_lines * 12 + 6) if captions is not None else 0
+    cell_h = tile + label_h + caption_h
     rows = (len(gt_images) + cols - 1) // cols
     out_w = cols * pair_w + max(cols - 1, 0) * gap
     out_h = rows * cell_h + max(rows - 1, 0) * gap
@@ -390,6 +394,10 @@ def save_gt_pred_grid(path, gt_images, pred_images, cols=4, gap=12, max_images=1
         # Thick black border around GT to mark it as the reference; thin border on the prediction.
         draw.rectangle((x, y + label_h, x + tile - 1, y + label_h + tile - 1), outline=(0, 0, 0), width=max(3, tile // 32))
         draw.rectangle((x + tile, y + label_h, x + pair_w - 1, y + label_h + tile - 1), outline=(0, 0, 0))
+        if captions is not None:
+            lines = textwrap.wrap(str(captions[idx]), width=62)[:caption_lines]
+            for line_idx, line in enumerate(lines):
+                draw.text((x + 4, y + label_h + tile + 2 + line_idx * 12), line, fill=(40, 40, 40))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     out.save(path)

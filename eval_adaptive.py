@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import wandb
 from algorithms.eval import adaptive_eval, distance_metrics, render_adaptive_trace, select_eval_batch
 from algorithms.utils import write_json
-from verifiers.eval_metrics import make_scorer
+from verifiers.eval_metrics import scorer_from_eval_cfg
 
 
 def resolve_run(run_dir, step):
@@ -82,7 +82,7 @@ def main():
     model.load(ckpt, use_ema=args.use_ema)
     model.net.eval()
     verifier = build_verifier(args.verifier, api_url=args.verifier_api_url)
-    scorer = make_scorer()
+    scorer = scorer_from_eval_cfg(OmegaConf.select(train_cfg, "trainer.eval"))
 
     batch = select_eval_batch(dataset, args.caption_seed, args.num_captions)
     sampler_cfg = SimpleNamespace(

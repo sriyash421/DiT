@@ -241,7 +241,7 @@ class OnPolicyTrainer:
         val_dataset=None,
         start_step=0,
     ):
-        from verifiers.eval_metrics import make_scorer
+        from verifiers.eval_metrics import scorer_from_eval_cfg
 
         self.model = model
         self.dataset = dataset
@@ -272,7 +272,7 @@ class OnPolicyTrainer:
         assert int(rollout.batch_size) % self.world_size == 0, "Rollout batch size must be divisible by world size."
         self.rollout_root = Path(rollout.storage_dir) if rollout.storage_dir is not None else self.log_dir / "rollouts"
 
-        self.scorer = make_scorer() if self.rank == 0 else None
+        self.scorer = scorer_from_eval_cfg(self.eval_cfg) if self.rank == 0 else None
 
         self.ema = deepcopy(unwrap_model(model.net))
         requires_grad(self.ema, False)

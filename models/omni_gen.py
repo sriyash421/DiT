@@ -244,7 +244,9 @@ class OmniGenModel:
         net = OmniGen.from_pretrained(self.model_path)
         net.llm.config.use_cache = False
         if gradient_checkpointing:
-            net.llm.gradient_checkpointing_enable()
+            # Non-reentrant is DDP-safe: reentrant checkpointing double-marks LoRA params ready under
+            # DDP find_unused_parameters=True ("marked ready twice"). use_reentrant=False avoids it.
+            net.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if self.lora_finetune:
             from peft import LoraConfig, get_peft_model
 
