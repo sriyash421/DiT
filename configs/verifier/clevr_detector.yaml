@@ -1,0 +1,12 @@
+# VLM-free CLEVR (color+shape) verifier -- in-process, no API/vLLM, ~2GB GPU (GDino+CLIP+probe).
+# Produces the one-object repair feedback the on-policy rollout conditions on. use_owl=false is both
+# scipy-free (works in .venv-omni) and slightly more accurate (exact-scene 0.94 vs 0.91).
+_target_: verifiers.detector_clevr.ClevrDetectorVerifier
+device: cuda
+probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe.pt
+use_probe: true
+use_owl: false
+box_threshold: 0.25
+text_threshold: 0.25
+nms_iou: 0.5
+blur_thresh: 50.0

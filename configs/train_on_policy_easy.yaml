@@ -1,0 +1,97 @@
+# On-policy feedback distillation on clevr_easy (color+shape), continuing from the 35k FULL-FINETUNE
+# checkpoint but training a fresh LoRA adapter on top of it. Verifier is the in-process VLM-free
+# ClevrDetectorVerifier (no vLLM). Target: 2x H200.
+#
+# IMPORTANT -- LoRA base weights: the 35k checkpoint is a FULL-FT .pt (no lora_ keys), so it CANNOT
+# be passed via `ckpt` when lora_finetune=true (set_peft_model_state_dict would match nothing and
+# leave the base as raw OmniGen-v1). Instead the 35k weights are baked into the base model dir below
+# via helper_scripts/export_omni_base.py, and `ckpt` stays null so only fresh LoRA is trained.
+defaults:
+  - dataset: clevr_easy
+  - verifier: clevr_detector
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+ckpt: null                     # fresh LoRA; the 35k full weights live in model.model_name_or_path
+results_dir: /gscratch/scrubbed/sriyash/omni-clevr-easy-on-policy
+experiment_name: on_policy_clevr_easy_lora_det
+
+dataset:
+  image_size: 256              # overrides the ${model.image_size} interpolation in dataset/clevr_easy.yaml
+
+model:
+  _target_: models.omni_gen.OmniGenModel
+  # Base seeded with the 35k full-FT weights (see export_omni_base.py). NOT Shitao/OmniGen-v1.
+  model_name_or_path: Shitao/OmniGen-v1
+  base_ckpt: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_finetune_clevr_easy/checkpoints/0035000.pt  # 35k full-FT weights -> frozen LoRA base (strict load, in-process; no export step)
+  image_height: 256
+  image_width: 256
+  vae: null
+  lora_finetune: true          # train a LoRA adapter on top of the 35k base
+  lora_rank: 128
+  lora_alpha: 128
+  lora_init: gaussian
+  lora_target_modules:
+    - qkv_proj
+    - o_proj
+    - gate_up_proj
+    - down_proj
+  gradient_checkpointing: false # H200 has the headroom
+  mixed_precision: bf16
+  condition_dropout_prob: 0.0
+  max_input_length_limit: 18000
+  use_feedback_images: true     # condition each corrected attempt on the prior attempt image
+  keep_raw_resolution: false
+
+trainer:
+  _target_: algorithms.on_policy.OnPolicyTrainer
+  verifier: ${verifier}
+  val_dataset:
+    _target_: datasets.build_clevr_dataset
+    datasets: ${dataset.datasets}
+    split: val
+    image_size: ${dataset.image_size}
+    use_disk: true
+    load_meta: true
+    load_images: false
+    load_context: false
+  sampler:
+    type: ddim
+    num_sampling_steps: 25
+    cfg_scale: 1.0
+    ddim_eta: 0.0
+  rollout:
+    samples: 1024              # prompts/rollout (train pool is 16,529) -> 1024*4 = 4096 records
+    length: 4                  # attempt + 3 feedback-conditioned corrections
+    use_ema: false             # no EMA -> rollout from the live policy
+    storage_dir: /dev/shm/clevr_easy_rollouts
+    log_samples: 8
+    batch_size: 32             # GLOBAL -> 16/GPU (must be divisible by world_size=2)
+  lr: 1e-4                     # fresh LoRA adapter -> higher LR than a full-FT continuation
+  weight_decay: 0.0
+  global_batch_size: 32        # 16/GPU x 2
+  global_seed: 0
+  updates_per_rollout: 640     # 5 epochs over 1024*4=4096 records at batch 32 = 5*4096/32
+  max_train_steps: 640000      # 1000 rollout phases x 640 updates
+  grad_clip: 1.0
+  ema_decay: 0.0               # no EMA maintained (skips the deepcopy)
+  log_every: 50
+  ckpt_every: 640              # one ckpt + one TTS eval per rollout phase
+  dataloader:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 8
+    drop_last: true
+  eval:
+    use_clevr_detector_scorer: true
+    caption_index: 42
+    batch_size: 64
+    seed: 0
+    steps: 4
+
+wandb:
+  project: DiT-qwen-clevr

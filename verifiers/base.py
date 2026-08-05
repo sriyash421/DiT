@@ -23,6 +23,7 @@ class VerificationResult:
     token_count: int = 0
     token_usage: dict = field(default_factory=dict)
     error: str = ""
+    breakdown: dict | None = None  # per-metric decomposition of score (enumeration scorer)
 
 
 def pil_to_png_base64(image):
@@ -125,10 +126,14 @@ def parse_caption_gt(caption):
         parts = descr.split()
         if len(parts) == 4:  # full_description == "<size> <color> <material> <shape>"
             objects.append({"size": parts[0], "color": parts[1], "material": parts[2], "shape": parts[3]})
+        elif len(parts) == 2:  # shape+color-only captions (e.g. clevr_easy): "<color> <shape>"
+            objects.append({"color": parts[0], "shape": parts[1]})
     if not objects:
         return [], [], []
 
-    labels = unique_labels(objects)
+    # unique_labels() needs size/material (label_candidates indexes both); only call it when an
+    # order clause is actually present to resolve, so shape+color-only captions stay parseable.
+    labels = unique_labels(objects) if ("horizontal:" in caption or "depth:" in caption) else []
 
     def order_indices(name):
         match = re.search(rf"{name}:\s*(.*?)\.", caption)
@@ -144,7 +149,8 @@ def build_distance_prompt(caption):
     presence plus the two orderings, as strict JSON. Scoring happens in code (score_structured_distance)."""
     objects, _, _ = parse_caption_gt(caption)
     listing = "\n".join(
-        f"{i + 1}. {o['size']} {o['color']} {o['material']} {o['shape']}" for i, o in enumerate(objects)
+        f"{i + 1}. " + " ".join(o[k] for k in ("size", "color", "material", "shape") if k in o)
+        for i, o in enumerate(objects)
     )
     order = USE_ORDER and len(objects) > 1
     fields = (
@@ -337,6 +343,167 @@ def build_text_feedback(caption, vlm_json):
     return "no update", "match"
 
 
+ENUM_COLORS = {"gray", "red", "blue", "green", "brown", "purple", "cyan", "yellow"}
+ENUM_SHAPES = {"cube", "sphere", "cylinder"}
+
+# Caption-free enumeration: the VLM only describes what it sees; matching, the feedback command and
+# the reward are all derived in code (enumeration_feedback). Size/material are requested but unused
+# downstream -- committing to them forces per-object scrutiny and measurably improves the color/shape
+# accuracy that IS kept (verifier benchmark, results/verifier_bench: 78% vs 75% without them).
+ENUMERATION_PROMPT = (
+    "List EVERY distinct object you can see in the image, one per line, in exactly this format:\n"
+    "<size> <color> <material> <shape> | <quality>\n"
+    "where size is small or large; color is one of gray, red, blue, green, brown, purple, cyan, yellow; "
+    "material is metal (shiny) or rubber (matte); shape is cube, sphere or cylinder -- if a shape is "
+    "distorted, give the closest one; quality is 'ok' if the object is crisp and well-formed, or 'blurry' "
+    "if it is deformed, smeared or half-formed. Look closely -- objects can be small or partly occluded; "
+    "list each one. Do not count reflections or shadows. Do not compare with anything or judge the image; "
+    "only describe it. Output only the list, nothing else."
+)
+
+
+def parse_enumeration(text):
+    """Parse the enumeration reply into dicts (color/shape/blurry). Lines without a valid color AND
+    shape are dropped, so nothing outside the CLEVR vocabulary can enter the diff."""
+    seen = []
+    for line in str(text).splitlines():
+        words = re.findall(r"[a-z]+", line.lower())
+        color = next((w for w in words if w in ENUM_COLORS), None)
+        shape = next((w for w in words if w in ENUM_SHAPES), None)
+        if color and shape:
+            seen.append({"color": color, "shape": shape, "blurry": "blurry" in words})
+    return seen
+
+
+# Enumeration scoring: a matched expected object earns SHAPE_WEIGHT for the right shape and COLOR_WEIGHT
+# for the right color (summing to 1.0). The scene score is the mean per-object credit over the EXPECTED
+# (caption) objects, so it lies in [0, 1] -- 1.0 = every expected object present with correct shape and
+# color. Missing objects contribute 0. A matched object the VLM flagged blurry/malformed keeps only
+# BLUR_KEEP of its credit, so blurriness is a soft penalty that only bites once shape+color are right.
+SHAPE_WEIGHT = 0.5
+COLOR_WEIGHT = 0.5
+BLUR_KEEP = 0.5
+
+
+def match_enumeration(objects, seen):
+    """Greedily match each expected object to an enumerated one: exact (color+shape) first, then
+    color-only (wrong shape), then shape-only (wrong color); the rest are missing. Returns a per-expected
+    list of dicts {kind, blurry, seen} (kind in exact/shape_bad/color_bad/missing) and the leftover
+    (surplus) enumerated objects."""
+    pool = [dict(s) for s in seen]
+
+    def take(pred):
+        for k, s in enumerate(pool):
+            if pred(s):
+                return pool.pop(k)
+        return None
+
+    matches = [None] * len(objects)
+    for kind, pred in (
+        ("exact", lambda o, s: s["color"] == o["color"] and s["shape"] == o["shape"]),
+        ("shape_bad", lambda o, s: s["color"] == o["color"]),   # right color, wrong shape
+        ("color_bad", lambda o, s: s["shape"] == o["shape"]),   # right shape, wrong color
+    ):
+        for i, o in enumerate(objects):
+            if matches[i] is not None:
+                continue
+            m = take(lambda s, o=o: pred(o, s))
+            if m is not None:
+                matches[i] = {"kind": kind, "blurry": bool(m.get("blurry")), "seen": m}
+    for i in range(len(objects)):
+        if matches[i] is None:
+            matches[i] = {"kind": "missing", "blurry": False, "seen": None}
+    return matches, pool
+
+
+def enumeration_breakdown(caption, seen):
+    """Score the enumerated scene against the caption in code (higher = better, all in [0, 1]).
+    Returns None if the caption has no objects, else a dict:
+      score     -- the reward: per-object credit (0.5 shape + 0.5 color, blur-discounted) summed over
+                   MATCHED objects, divided by (#expected + #surplus-extra). Mirrors the CompBench
+                   overall score, where credit is normalized by what was asked for and extra detections
+                   cost you -- here every surplus object grows the denominator, so 3/3 correct with one
+                   spurious object scores 3/4, not 1.0.
+      presence  -- fraction of expected objects that were matched at all (recall)
+      shape     -- fraction of expected objects with the correct shape
+      color     -- fraction of expected objects with the correct color
+      quality   -- fraction of MATCHED objects that are crisp (not blurry); 1.0 if none matched
+      precision -- matched / (matched + surplus-extra); how much of the scene is wanted; 1.0 if empty
+    Substitution is already absorbed by match_enumeration (a wrong-color/wrong-shape object is paired to
+    its expected slot), so `extra` is only genuinely surplus objects -- exactly what should cost precision.
+    """
+    objects, _, _ = parse_caption_gt(caption)
+    n = len(objects)
+    if n == 0:
+        return None
+    matches, extra = match_enumeration(objects, seen)
+    n_extra = len(extra)
+    credit = shape_ok = color_ok = present = blurry = 0.0
+    for m in matches:
+        if m["kind"] == "missing":
+            continue
+        present += 1
+        s_ok = m["kind"] in ("exact", "color_bad")   # shape correct
+        c_ok = m["kind"] in ("exact", "shape_bad")   # color correct
+        shape_ok += s_ok
+        color_ok += c_ok
+        obj_credit = SHAPE_WEIGHT * s_ok + COLOR_WEIGHT * c_ok
+        if m["blurry"]:
+            obj_credit *= BLUR_KEEP
+            blurry += 1
+        credit += obj_credit
+    return {
+        "score": credit / (n + n_extra),   # surplus extras dilute the reward (precision cost)
+        "presence": present / n,
+        "shape": shape_ok / n,
+        "color": color_ok / n,
+        "quality": (1.0 - blurry / present) if present else 1.0,
+        "precision": present / (present + n_extra) if (present + n_extra) else 1.0,
+    }
+
+
+def enumeration_feedback(caption, seen):
+    """Diff the enumerated scene against the caption entirely in code. Returns (command, rule, score):
+    one one-object/one-edit command chosen by priority (replace/add missing -> shape -> color ->
+    remove extra -> blurry LAST), and the [0, 1] reward from enumeration_breakdown (score field)."""
+    objects, _, _ = parse_caption_gt(caption)
+    if not objects:
+        return "no update", "match", None
+    breakdown = enumeration_breakdown(caption, seen)
+    score = breakdown["score"]
+    matches, extra = match_enumeration(objects, seen)
+
+    missing = [i for i, m in enumerate(matches) if m["kind"] == "missing"]
+    wrong_shape = [i for i, m in enumerate(matches) if m["kind"] == "shape_bad"]  # right color, wrong shape
+    wrong_color = [i for i, m in enumerate(matches) if m["kind"] == "color_bad"]  # right shape, wrong color
+
+    def cs(i):
+        return objects[i]["color"], objects[i]["shape"]
+
+    if missing and extra:
+        (c, s), e = cs(missing[0]), extra[0]
+        return f"replace the {e['color']} {e['shape']} with a {c} {s}", "extra-replace", score
+    if missing:
+        c, s = cs(missing[0])
+        return f"add a {c} {s}", "missing", score
+    if wrong_shape:
+        c, s = cs(wrong_shape[0])
+        return f"fix shape of the {c} object to {s}", "shape", score
+    if wrong_color:
+        c, s = cs(wrong_color[0])
+        seen_color = matches[wrong_color[0]]["seen"]["color"]
+        return f"change color of the {seen_color} {s} to {c}", "color", score
+    if extra:
+        e = extra[0]
+        return f"remove the {e['color']} {e['shape']}", "extra-remove", score
+    # blurry LAST: only once every expected object is present with correct color and shape
+    for i, m in enumerate(matches):
+        if m["blurry"]:
+            c, s = cs(i)
+            return f"fix the {c} {s}", "blurry", score
+    return "no update", "match", score
+
+
 def total_tokens_from_usage(usage):
     for key in ("total_tokens", "totalTokenCount"):
         value = usage.get(key)
@@ -389,6 +556,10 @@ class OpenAIChatVerifier(FeedbackVerifier):
         enable_thinking=False,
         image_size=None,
         extra_payload=None,
+        use_enumeration=False,
+        top_p=None,
+        top_k=None,
+        presence_penalty=None,
     ):
         self.api_key = api_key
         self.model = model
@@ -401,6 +572,13 @@ class OpenAIChatVerifier(FeedbackVerifier):
         self.enable_thinking = bool(enable_thinking)
         self.image_size = None if image_size is None else int(image_size)
         self.extra_payload = dict(extra_payload or {})
+        # Enumeration mode: one caption-free "list what you see" call per image; the feedback command
+        # AND the reward come from enumeration_feedback in code. See results/verifier_bench.
+        self.use_enumeration = bool(use_enumeration)
+        # Optional sampling params (vLLM supports them in the payload; None = server default).
+        for key, value in (("top_p", top_p), ("top_k", top_k), ("presence_penalty", presence_penalty)):
+            if value is not None:
+                self.extra_payload[key] = value
 
     def _prepare_image(self, image):
         return resize_square(image, self.image_size) if self.image_size else image
@@ -408,8 +586,25 @@ class OpenAIChatVerifier(FeedbackVerifier):
     def _record_usage(self, usage):
         """Hook for subclasses to accumulate per-call usage stats (e.g. OpenRouter cost). No-op here."""
 
+    def _enumeration_row(self, caption, attempt_image):
+        """One enumeration call -> (command, score) via the code diff. The raw enumeration cannot fail
+        to parse (invalid lines are dropped), so a transport-ok call always yields a usable result."""
+        result = self._post_prompt(ENUMERATION_PROMPT, attempt_image, parse_feedback=False)
+        if not result.ok:
+            return result
+        seen = parse_enumeration(result.feedback)
+        command, _rule, score = enumeration_feedback(caption, seen)
+        result.breakdown = enumeration_breakdown(caption, seen)
+        result.feedback = command
+        result.score = score
+        return result
+
     def _verify_row(self, caption, gt_image, attempt_image, feedback_history):
         # gt_image is intentionally unused: feedback is judged against the caption only (no leakage).
+        if self.use_enumeration:
+            # Stateless: feedback_history is ignored -- the diff re-reports the worst remaining error,
+            # which changes as the image improves, so repeats only happen while the error persists.
+            return self._enumeration_row(caption, attempt_image)
         return self._post_prompt(
             build_feedback_prompt(
                 caption,
@@ -422,6 +617,8 @@ class OpenAIChatVerifier(FeedbackVerifier):
 
     def _distance_row(self, caption, gt_image, attempt_image):
         # gt_image unused: the structured check is judged against the caption, not the GT image.
+        if self.use_enumeration:
+            return self._enumeration_row(caption, attempt_image)
         result = self._post_prompt(build_distance_prompt(caption), attempt_image, parse_feedback=False)
         if not result.ok:
             return result

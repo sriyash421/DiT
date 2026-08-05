@@ -19,6 +19,7 @@ class OpenRouterVerifier(OpenAIChatVerifier):
         workers=8,
         enable_thinking=False,
         image_size=None,
+        use_enumeration=False,
     ):
         super().__init__(
             api_key=os.environ[api_key_env],
@@ -31,6 +32,7 @@ class OpenRouterVerifier(OpenAIChatVerifier):
             workers=workers,
             enable_thinking=enable_thinking,
             image_size=image_size,
+            use_enumeration=use_enumeration,
             # Ask OpenRouter to return the USD cost of each call in usage.cost.
             extra_payload={"usage": {"include": True}},
         )

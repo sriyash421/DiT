@@ -36,13 +36,20 @@ def mean_flat(x):
     return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 
-def training_losses(model, x1, model_kwargs):
-    """Flow-matching loss, vendored verbatim from OmniGen.train_helper.loss."""
+def training_losses(model, x1, model_kwargs, x0=None):
+    """Flow-matching loss, vendored verbatim from OmniGen.train_helper.loss.
+
+    `x0` optionally supplies the noise instead of drawing it fresh. On-policy passes the SAME initial
+    latent that generated the attempt in context, so the model learns the specific
+    (x_T, image-from-x_T, feedback) -> corrected-image path it will actually face at inference.
+    The objective stays unbiased: each stored x_T was drawn from N(0, I) independently of the target.
+    """
     B = len(x1)
-    if isinstance(x1, (list, tuple)):
-        x0 = [torch.randn_like(img) for img in x1]
-    else:
-        x0 = torch.randn_like(x1)
+    if x0 is None:
+        if isinstance(x1, (list, tuple)):
+            x0 = [torch.randn_like(img) for img in x1]
+        else:
+            x0 = torch.randn_like(x1)
     u = torch.normal(mean=0.0, std=1.0, size=(B,))
     t = (1 / (1 + torch.exp(-u))).to(x1[0])
 
@@ -63,20 +70,35 @@ def training_losses(model, x1, model_kwargs):
     return {"loss": loss}
 
 
-def history_instruction(caption, feedback_history):
-    """OmniGen prompt for a rollout context with full interleaved history.
+NO_CHANGE_FEEDBACK = "no changes needed, the image already matches the prompt"
 
-    No history -> the raw caption (matches text-to-image training). With N prior attempts, all N
-    are referenced as contiguous <|image_1|>..<|image_N|> placeholders (the count the processor
-    requires) followed by their feedback, plus the edit instruction.
+
+def history_instruction(caption, feedback_history):
+    """OmniGen prompt for a rollout context with interleaved history.
+
+    No history -> the raw caption (matches text-to-image training). With N prior attempts the
+    history is INTERLEAVED, repeating the prompt after every attempt:
+
+        Prompt: <caption>. Attempted image: <|image_1|>. Original prompt: <caption>. Feedback: ...
+                           Attempted image: <|image_2|>. Original prompt: <caption>. Feedback: ...
+
+    Repeating the caption keeps it close to the end of the sequence, so attention does not lose the
+    original request as the history grows (an image contributes 256 tokens, so with 3 prior attempts
+    a single leading caption sits ~800 tokens back). The processor only requires the image ids to be
+    1..N and continuous -- they need not be adjacent -- so interleaving is safe.
+
+    An empty feedback (the verifier found nothing to fix) is stated explicitly rather than left
+    blank, so "correct already" is a signal the model can learn rather than a missing field.
     """
     if not feedback_history:
         return caption
-    images = " ".join(f"<|image_{idx + 1}|>" for idx in range(len(feedback_history)))
-    feedbacks = " ".join(f"Feedback {idx}: {str(feedback).strip()}" for idx, feedback in enumerate(feedback_history))
-    return (
-        f"{images} Edit the input image so it matches this CLEVR description: {caption}. {feedbacks}"
-    )
+    parts = [f"Prompt: {caption}."]
+    for idx, feedback in enumerate(feedback_history):
+        text = str(feedback).strip() or NO_CHANGE_FEEDBACK
+        parts.append(
+            f"Attempted image: <|image_{idx + 1}|>. Original prompt: {caption}. Feedback: {text}."
+        )
+    return " ".join(parts)
 
 
 class OmniClevrDataset(Dataset):
@@ -212,8 +234,10 @@ class OmniGenModel:
         use_feedback_images,
         keep_raw_resolution,
         device,
+        stored_noise_prob=1.0,
         context_dim=None,
         context_dropout_prob=None,
+        base_ckpt=None,
     ):
         from diffusers.models import AutoencoderKL
         from huggingface_hub import snapshot_download
@@ -230,6 +254,8 @@ class OmniGenModel:
         self.max_input_length_limit = int(max_input_length_limit)
         self.use_feedback_images = bool(use_feedback_images)
         self.keep_raw_resolution = bool(keep_raw_resolution)
+        # 1.0 = always reuse the rollout's x_T as the flow-matching noise; 0.0 = always fresh.
+        self.stored_noise_prob = float(stored_noise_prob)
         self.transform = build_omni_transform(self.image_height, self.image_width)
 
         if os.path.exists(model_name_or_path):
@@ -247,6 +273,13 @@ class OmniGenModel:
             # Non-reentrant is DDP-safe: reentrant checkpointing double-marks LoRA params ready under
             # DDP find_unused_parameters=True ("marked ready twice"). use_reentrant=False avoids it.
             net.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if base_ckpt:
+            from algorithms.utils import load_checkpoint
+            # Seed the raw OmniGen base with a prior full-finetune checkpoint BEFORE wrapping
+            # with LoRA, so fresh adapters train on top of those weights. strict=True on purpose:
+            # a key mismatch MUST raise, never silently skip -- a silent skip would leave the
+            # base un-finetuned and train an identity-init adapter on the wrong weights.
+            net.load_state_dict(load_checkpoint(base_ckpt), strict=True)
         if self.lora_finetune:
             from peft import LoraConfig, get_peft_model
 
@@ -282,8 +315,18 @@ class OmniGenModel:
 
             from algorithms.utils import unwrap_model
 
-            set_peft_model_state_dict(unwrap_model(self.net), state)
-            return [], []
+            # Report what PEFT actually matched. Returning a hardcoded ([], []) here made train.py
+            # always print "missing=0, unexpected=0", so a key-name mismatch would load NOTHING and
+            # stay silent -- and because LoRA inits B=0, that failure mode is an identity adapter,
+            # i.e. silently training the raw base model.
+            res = set_peft_model_state_dict(unwrap_model(self.net), state)
+            # PEFT delegates to load_state_dict(strict=False) on the FULL model, so `missing_keys`
+            # always lists every BASE tensor too (~211 for OmniGen) -- those legitimately are not in
+            # a LoRA-only checkpoint and come from the pretrained weights. Reporting them raw reads
+            # like a failed load. Only a LoRA key going missing is a real problem, so filter to those;
+            # `unexpected` stays raw (a non-empty list means checkpoint keys the model did not match).
+            missing = [k for k in getattr(res, "missing_keys", []) if "lora_" in k]
+            return missing, list(getattr(res, "unexpected_keys", []))
         return self.net.load_state_dict(state, strict=False)
 
     def loss(self, batch):
@@ -309,7 +352,19 @@ class OmniGenModel:
             "past_key_values": None,
             "return_past_key_values": False,
         }, self.device)
-        return training_losses(self.net, output_latents, model_kwargs)["loss"].mean()
+        # Optional stored rollout noise (see training_losses). Falls back to fresh noise when the
+        # batch has none, so offline training is unchanged.
+        x0 = batch.get("init_latents")
+        if x0 is not None and random.random() >= self.stored_noise_prob:
+            x0 = None            # this step falls back to fresh noise (ablation / regularisation)
+        if x0 is not None:
+            if isinstance(output_latents, (list, tuple)):
+                x0 = [n.to(device=self.device, dtype=l.dtype) if n is not None else torch.randn_like(l)
+                      for n, l in zip(x0, output_latents)]
+            else:
+                x0 = torch.stack([n if n is not None else torch.randn(output_latents.shape[1:])
+                                  for n in x0]).to(device=self.device, dtype=output_latents.dtype)
+        return training_losses(self.net, output_latents, model_kwargs, x0=x0)["loss"].mean()
 
     def rollout_loss(self, batch):
         """Turn rollout rows (full history) into OmniGen edit examples and run the flow loss.
@@ -338,10 +393,15 @@ class OmniGenModel:
                 "source_index": 0,
                 "is_feedback": bool(feedback_history),
             })
-        return self.loss(self._rollout_collator(features))
+        collated = self._rollout_collator(features)
+        # carry the stored sampling noise through the collator (it only knows about images/text)
+        if batch.get("init_latents") is not None:
+            collated["init_latents"] = batch["init_latents"]
+        return self.loss(collated)
 
     @torch.no_grad()
-    def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None):
+    def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None,
+                 return_latents=False):
         """Single-forward (no-CFG) sampling: run the same model.forward used in training through the
         OmniGen scheduler with one conditional pass per image. Bypasses OmniGenPipeline, which always
         computes a wasted unconditional pass at cfg_scale=1.0 (2x-3x the compute). cfg_scale/ddim_eta
@@ -396,11 +456,17 @@ class OmniGenModel:
         scheduler = OmniGenScheduler(num_steps=int(num_sampling_steps))
         # __init__ disables the LLM KV cache for training; generation needs it (the scheduler crops
         # conditioning tokens after step 0, expecting them cached). forward_with_cfg does the same.
+        # HF forces use_cache back to False whenever gradient checkpointing is enabled AND the module
+        # is in train() mode (module.training), silently breaking this cache assumption and producing
+        # garbage samples. Drop to eval() for the duration of sampling so the cache actually sticks.
+        was_training = module.training
+        module.eval()
         module.llm.config.use_cache = True
         try:
             samples = scheduler(latents, module.forward, model_kwargs, use_kv_cache=True, offload_kv_cache=False)
         finally:
             module.llm.config.use_cache = False
+            module.train(was_training)
 
         samples = samples.to(torch.float32)
         if self.vae.config.shift_factor is not None:
@@ -412,7 +478,11 @@ class OmniGenModel:
         from PIL import Image as PILImage
 
         samples = (samples * 255).to("cpu", dtype=torch.uint8).permute(0, 2, 3, 1).numpy()
-        return [PILImage.fromarray(sample) for sample in samples]
+        images = [PILImage.fromarray(sample) for sample in samples]
+        if return_latents:
+            # the x_T each image was denoised from, one CPU tensor per item
+            return images, [latents[i].detach().to("cpu") for i in range(len(images))]
+        return images
 
     def ddp(self, device):
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -421,6 +491,18 @@ class OmniGenModel:
 
     def trainable_parameters(self):
         return [p for p in self.net.parameters() if p.requires_grad]
+
+    def lora_state_of(self, module):
+        """LoRA-only state dict for a module (e.g. the EMA copy). The EMA is a deepcopy of the whole
+        net, so saving its full state_dict writes all 3.8B base params -- 7.6GB per checkpoint --
+        even though the base weights are frozen and identical to the pretrained model."""
+        from algorithms.utils import unwrap_model
+
+        if self.lora_finetune:
+            from peft.utils import get_peft_model_state_dict
+
+            return get_peft_model_state_dict(unwrap_model(module))
+        return unwrap_model(module).state_dict()
 
     def checkpoint_state(self):
         from algorithms.utils import unwrap_model
