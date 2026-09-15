@@ -69,7 +69,7 @@ trainer:
     use_ema: false             # no EMA -> rollout from the live policy
     storage_dir: /dev/shm/clevr_easy_rollouts
     log_samples: 8
-    batch_size: 32             # GLOBAL -> 16/GPU (must be divisible by world_size=2)
+    batch_size: 64             # GLOBAL -> 32/GPU (rollout gen is no_grad; ~2x fewer gen calls)
   lr: 1e-4                     # fresh LoRA adapter -> higher LR than a full-FT continuation
   weight_decay: 0.0
   global_batch_size: 32        # 16/GPU x 2

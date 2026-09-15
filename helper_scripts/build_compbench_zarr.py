@@ -20,10 +20,11 @@ def main(args):
     out = Path(args.out) if args.out else data / "data.zarr"
     manifest = [
         json.loads(line)
-        for path in sorted(data.glob("manifest_*.jsonl"))
+        for path in sorted(data.glob(f"{args.manifest_prefix}*.jsonl"))
         for line in path.read_text().splitlines()
         if line.strip()
     ]
+    assert manifest, f"no rows matched {data}/{args.manifest_prefix}*.jsonl"
 
     train = defaultdict(list)
     val = []
@@ -55,6 +56,9 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="/gscratch/scrubbed/sriyash/comp_bench")
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--manifest-prefix", type=str, default="manifest_",
+                        help="Manifest file prefix to read; use 'gdino_manifest_' to select on the "
+                             "open-vocab Grounding DINO rescore instead of the original scores.")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--overwrite", action="store_true")
     main(parser.parse_args())

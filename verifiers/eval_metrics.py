@@ -23,11 +23,17 @@ def scorer_from_eval_cfg(eval_cfg, **kwargs):
     # VLM-free CLEVR (color+shape) scorer: GDino detect + learned CLIP-probe shape + HSV color.
     if eval_cfg is not None and bool(eval_cfg.get("use_clevr_detector_scorer", False)):
         from verifiers.detector_clevr import ClevrDetectorVerifier, DEFAULT_PROBE
+        # cell_centres/cell_tol must be forwarded too: this builds a SECOND verifier instance for
+        # eval, so without them eval/distance_* would stay position-blind while the rollout verifier
+        # scores placement -- the two would silently disagree about what "correct" means.
+        cell_centres = eval_cfg.get("detector_cell_centres", None)
         return ClevrDetectorVerifier(
             device="cuda",
             probe_path=eval_cfg.get("detector_probe_path", DEFAULT_PROBE),
             use_probe=bool(eval_cfg.get("detector_use_probe", True)),
             use_owl=bool(eval_cfg.get("detector_use_owl", False)),  # scipy-free by default (.venv-omni has no scipy)
+            cell_centres=[list(c) for c in cell_centres] if cell_centres else None,
+            cell_tol=float(eval_cfg.get("detector_cell_tol", 30.0)),
         )
     if eval_cfg is not None and bool(eval_cfg.get("use_gdino_scorer", False)):
         from verifiers.gdino_feedback import GDinoNumeracyFeedbackVerifier

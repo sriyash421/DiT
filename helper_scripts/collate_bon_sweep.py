@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-SUBMETRICS = ("combined", "content", "presence", "shape", "color", "extra")
+SUBMETRICS = ("score", "presence", "shape", "color", "quality", "precision")
 POW2 = [1, 2, 4, 8, 16, 32, 64]
 
 

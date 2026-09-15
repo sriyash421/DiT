@@ -72,6 +72,11 @@ def training_losses(model, x1, model_kwargs, x0=None):
 
 NO_CHANGE_FEEDBACK = "no changes needed, the image already matches the prompt"
 
+# Stand-in used when caption dropout fires on a feedback row. Deliberately a well-formed but
+# contentless description: keeping the instruction's shape intact means the only thing removed is
+# the information that lets the model shortcut straight to the target.
+MASKED_CAPTION = "a scene"
+
 
 def history_instruction(caption, feedback_history):
     """OmniGen prompt for a rollout context with interleaved history.
@@ -238,6 +243,7 @@ class OmniGenModel:
         context_dim=None,
         context_dropout_prob=None,
         base_ckpt=None,
+        lora_dropout=0.0,
     ):
         from diffusers.models import AutoencoderKL
         from huggingface_hub import snapshot_download
@@ -289,6 +295,7 @@ class OmniGenModel:
             lora_config = LoraConfig(
                 r=int(lora_rank),
                 lora_alpha=int(lora_alpha),
+                lora_dropout=float(lora_dropout),
                 init_lora_weights=lora_init,
                 target_modules=list(lora_target_modules),
             )
@@ -329,7 +336,9 @@ class OmniGenModel:
             return missing, list(getattr(res, "unexpected_keys", []))
         return self.net.load_state_dict(state, strict=False)
 
-    def loss(self, batch):
+    def loss(self, batch, weights=None):
+        """Flow-matching loss. `weights` is an optional per-sample weight vector (the curriculum
+        weights each chain position differently); None keeps the plain batch mean."""
         from OmniGen.utils import vae_encode, vae_encode_list
 
         output_images = move_to_device(batch["output_images"], self.device)
@@ -364,13 +373,29 @@ class OmniGenModel:
             else:
                 x0 = torch.stack([n if n is not None else torch.randn(output_latents.shape[1:])
                                   for n in x0]).to(device=self.device, dtype=output_latents.dtype)
-        return training_losses(self.net, output_latents, model_kwargs, x0=x0)["loss"].mean()
+        per_sample = training_losses(self.net, output_latents, model_kwargs, x0=x0)["loss"]
+        if weights is None:
+            return per_sample.mean()
+        # Weighted mean, normalised by the weight sum so the gradient scale does not depend on the
+        # batch's position mix -- a plain (loss * w).mean() would shrink whenever a batch happened
+        # to draw more low-weight early positions.
+        w = torch.as_tensor(weights, device=per_sample.device, dtype=per_sample.dtype)
+        return (per_sample * w).sum() / w.sum().clamp_min(1e-8)
 
-    def rollout_loss(self, batch):
+    def rollout_loss(self, batch, weights=None, caption_dropout_prob=0.0):
         """Turn rollout rows (full history) into OmniGen edit examples and run the flow loss.
 
         Mirrors OmniClevrDataset/OmniClevrCollator: each row's prior attempts become input images
         for a multi-image edit instruction; the GT is the output image. Reuses self.loss.
+
+        `caption_dropout_prob` replaces the caption with a neutral placeholder on FEEDBACK rows
+        (those with a non-empty history). In clevr_g6 the caption alone fully determines the target,
+        so the attempt and critique are redundant inputs and the model can reach the target without
+        ever reading them -- with only 100 captions that shortcut is much cheaper than learning the
+        edit operator. Hiding the caption leaves (source image + critique) as the only route, which
+        is what forces the feedback pathway to carry information. Rows at position 0 are never
+        dropped: they have no source image, so blanking the caption would leave nothing to condition
+        on. The caption is always present at inference -- this is a train-time regulariser.
         """
         if self._rollout_collator is None:
             from algorithms.utils import unwrap_model
@@ -381,9 +406,13 @@ class OmniGenModel:
                 keep_raw_resolution=self.keep_raw_resolution,
             )
         features = []
+        dropped = 0
         for gt_image, caption, feedback_history, attempt_images in zip(
             batch["gt_image"], batch["caption"], batch["feedback_history"], batch["attempt_images"]
         ):
+            if feedback_history and caption_dropout_prob > 0.0 and random.random() < caption_dropout_prob:
+                caption = MASKED_CAPTION
+                dropped += 1
             instruction = history_instruction(caption, feedback_history)
             input_images = [self.transform(image) for image in attempt_images] or None
             mllm_input = self.processor.process_multi_modal_prompt(instruction, input_images)
@@ -397,11 +426,12 @@ class OmniGenModel:
         # carry the stored sampling noise through the collator (it only knows about images/text)
         if batch.get("init_latents") is not None:
             collated["init_latents"] = batch["init_latents"]
-        return self.loss(collated)
+        self.last_caption_dropped = dropped
+        return self.loss(collated, weights=weights)
 
     @torch.no_grad()
     def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None,
-                 return_latents=False):
+                 return_latents=False, init_latents=None):
         """Single-forward (no-CFG) sampling: run the same model.forward used in training through the
         OmniGen scheduler with one conditional pass per image. Bypasses OmniGenPipeline, which always
         computes a wasted unconditional pass at cfg_scale=1.0 (2x-3x the compute). cfg_scale/ddim_eta
@@ -437,13 +467,21 @@ class OmniGenModel:
         else:
             input_img_latents = None
 
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(int(seed))
-        latents = torch.randn(
-            len(captions), 4, self.image_height // 8, self.image_width // 8,
-            device=self.device, dtype=self.weight_dtype, generator=generator,
-        )
+        if init_latents is not None:
+            # Caller supplies x_T explicitly. Used by the on-policy rollout so every attempt in a
+            # feedback chain starts from the SAME noise -- otherwise a row dropping out of `active`
+            # shifts the remaining rows and silently changes their noise mid-chain.
+            latents = init_latents.to(device=self.device, dtype=self.weight_dtype)
+            if latents.shape[0] != len(captions):
+                raise ValueError(f"init_latents has {latents.shape[0]} rows, expected {len(captions)}")
+        else:
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(int(seed))
+            latents = torch.randn(
+                len(captions), 4, self.image_height // 8, self.image_width // 8,
+                device=self.device, dtype=self.weight_dtype, generator=generator,
+            )
         model_kwargs = move_to_device({
             "input_ids": input_ids,
             "input_img_latents": input_img_latents,

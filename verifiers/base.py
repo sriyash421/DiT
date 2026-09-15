@@ -131,6 +131,16 @@ def parse_caption_gt(caption):
     if not objects:
         return [], [], []
 
+    # Optional "cells: 0, 2, 3." clause (clevr_g6): bind each expected object to a grid cell, in
+    # caption order. Captions without it are unaffected -- `cell` simply stays absent and every
+    # downstream check falls back to the original position-blind behaviour.
+    cell_match = re.search(r"cells:\s*([0-9,\s]*)", caption)
+    if cell_match:
+        cells = [int(tok) for tok in cell_match.group(1).replace(".", "").split(",") if tok.strip()]
+        if len(cells) == len(objects):
+            for obj, cell in zip(objects, cells):
+                obj["cell"] = cell
+
     # unique_labels() needs size/material (label_candidates indexes both); only call it when an
     # order clause is actually present to resolve, so shape+color-only captions stay parseable.
     labels = unique_labels(objects) if ("horizontal:" in caption or "depth:" in caption) else []
@@ -392,6 +402,32 @@ def match_enumeration(objects, seen):
     (surplus) enumerated objects."""
     pool = [dict(s) for s in seen]
 
+    # Cell-keyed matching: when the caption names cells and the detector reports them, an object is
+    # only "the" expected object if it is in the RIGHT cell. A misplaced object then falls out as
+    # missing-at-its-cell plus a surplus elsewhere, so placement is penalised by the existing
+    # scoring with no extra metric keys.
+    if objects and all("cell" in o for o in objects) and any(s.get("cell") is not None for s in seen):
+        by_cell = {s["cell"]: dict(s) for s in pool if s.get("cell") is not None}
+        matches = []
+        for o in objects:
+            s = by_cell.pop(o["cell"], None)
+            if s is None:
+                kind = "missing"
+            elif s["color"] == o["color"] and s["shape"] == o["shape"]:
+                kind = "exact"
+            elif s["color"] == o["color"]:
+                kind = "shape_bad"
+            elif s["shape"] == o["shape"]:
+                kind = "color_bad"
+            else:
+                kind = "missing"          # wrong colour AND wrong shape -> not this object at all
+            matches.append({"kind": kind, "blurry": bool(s.get("blurry")) if s else False,
+                            "seen": s if kind != "missing" else None})
+            if kind == "missing" and s is not None:
+                by_cell[o["cell"]] = s     # keep it as surplus
+        leftovers = list(by_cell.values()) + [dict(s) for s in pool if s.get("cell") is None]
+        return matches, leftovers
+
     def take(pred):
         for k, s in enumerate(pool):
             if pred(s):
@@ -462,10 +498,15 @@ def enumeration_breakdown(caption, seen):
     }
 
 
-def enumeration_feedback(caption, seen):
-    """Diff the enumerated scene against the caption entirely in code. Returns (command, rule, score):
-    one one-object/one-edit command chosen by priority (replace/add missing -> shape -> color ->
-    remove extra -> blurry LAST), and the [0, 1] reward from enumeration_breakdown (score field)."""
+def enumeration_feedback(caption, seen, max_edits=None):
+    """Diff the enumerated scene against the caption entirely in code.
+
+    Returns (command, rule, score). By default the command lists EVERY current error, ordered by the
+    priority ladder (move -> replace/add missing -> shape -> color -> remove extra -> blurry last)
+    and joined with "; ". The model regenerates the whole image at each feedback step, so telling it
+    only one error invites fixing that one while breaking another; the full list states every
+    constraint the regeneration has to satisfy. `max_edits=1` restores the old one-edit behaviour.
+    """
     objects, _, _ = parse_caption_gt(caption)
     if not objects:
         return "no update", "match", None
@@ -476,32 +517,58 @@ def enumeration_feedback(caption, seen):
     missing = [i for i, m in enumerate(matches) if m["kind"] == "missing"]
     wrong_shape = [i for i, m in enumerate(matches) if m["kind"] == "shape_bad"]  # right color, wrong shape
     wrong_color = [i for i, m in enumerate(matches) if m["kind"] == "color_bad"]  # right shape, wrong color
+    extra = list(extra)
 
     def cs(i):
         return objects[i]["color"], objects[i]["shape"]
 
-    if missing and extra:
-        (c, s), e = cs(missing[0]), extra[0]
-        return f"replace the {e['color']} {e['shape']} with a {c} {s}", "extra-replace", score
-    if missing:
-        c, s = cs(missing[0])
-        return f"add a {c} {s}", "missing", score
-    if wrong_shape:
-        c, s = cs(wrong_shape[0])
-        return f"fix shape of the {c} object to {s}", "shape", score
-    if wrong_color:
-        c, s = cs(wrong_color[0])
-        seen_color = matches[wrong_color[0]]["seen"]["color"]
-        return f"change color of the {seen_color} {s} to {c}", "color", score
-    if extra:
-        e = extra[0]
-        return f"remove the {e['color']} {e['shape']}", "extra-remove", score
+    def at(i):
+        # only mention a cell when the caption actually specified one
+        cell = objects[i].get("cell")
+        return f" in cell {cell}" if cell is not None else ""
+
+    edits = []          # (rule, command)
+
+    # A misplaced object shows up as missing-at-its-cell plus an identical surplus elsewhere.
+    # Name that directly instead of telling the model to add and remove the same thing.
+    for i in list(missing):
+        c, s_ = cs(i)
+        hit = next((e for e in extra if e["color"] == c and e["shape"] == s_), None)
+        if hit is None:
+            continue
+        src = hit.get("cell")
+        where = f" from cell {src}" if src is not None else ""
+        edits.append(("move", f"move the {c} {s_}{where} to cell {objects[i]['cell']}"
+                              if objects[i].get("cell") is not None else f"move the {c} {s_}"))
+        missing.remove(i); extra.remove(hit)
+
+    while missing and extra:
+        i, e = missing.pop(0), extra.pop(0)
+        c, s_ = cs(i)
+        edits.append(("extra-replace", f"replace the {e['color']} {e['shape']} with a {c} {s_}{at(i)}"))
+    for i in missing:
+        c, s_ = cs(i)
+        edits.append(("missing", f"add a {c} {s_}{at(i)}"))
+    for i in wrong_shape:
+        c, s_ = cs(i)
+        edits.append(("shape", f"fix shape of the {c} object{at(i)} to {s_}"))
+    for i in wrong_color:
+        c, s_ = cs(i)
+        edits.append(("color", f"change color of the {matches[i]['seen']['color']} {s_}{at(i)} to {c}"))
+    for e in extra:
+        edits.append(("extra-remove", f"remove the {e['color']} {e['shape']}"))
     # blurry LAST: only once every expected object is present with correct color and shape
-    for i, m in enumerate(matches):
-        if m["blurry"]:
-            c, s = cs(i)
-            return f"fix the {c} {s}", "blurry", score
-    return "no update", "match", score
+    if not edits:
+        for i, m in enumerate(matches):
+            if m["blurry"]:
+                c, s_ = cs(i)
+                edits.append(("blurry", f"fix the {c} {s_}{at(i)}"))
+
+    if not edits:
+        return "no update", "match", score
+    if max_edits is not None:
+        edits = edits[:int(max_edits)]
+    return "; ".join(cmd for _, cmd in edits), edits[0][0], score
 
 
 def total_tokens_from_usage(usage):

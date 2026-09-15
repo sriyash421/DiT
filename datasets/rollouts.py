@@ -51,10 +51,20 @@ class RolloutBuffer(Dataset):
             "gt_path": record["gt_path"],
             "attempt_path": record["attempt_path"],
             "feedback": record["feedback"],
+            # initial sampling latent that produced this attempt (None for older buffers)
+            "init_latent": (torch.load(record["latent_path"], map_location="cpu", weights_only=False)
+                            if record.get("latent_path") else None),
         }
 
 
 def rollout_collate(batch):
     """Group rollout rows into per-field lists; the model's rollout_loss does tensor conversion."""
     keys = ("gt_image", "caption", "feedback_history", "attempt_images", "attempt_paths")
-    return {key: [item[key] for item in batch] for key in keys}
+    out = {key: [item[key] for item in batch] for key in keys}
+    latents = [item.get("init_latent") for item in batch]
+    out["init_latents"] = latents if any(l is not None for l in latents) else None
+    # Position of each row within its chain: 0 is the first draft (caption only), t>0 are the
+    # feedback-conditioned repairs. The curriculum weights the loss by this, and caption dropout
+    # keys off it. Derived here rather than stored, so the record schema is unchanged.
+    out["chain_pos"] = [len(item["feedback_history"]) for item in batch]
+    return out

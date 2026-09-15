@@ -58,12 +58,13 @@ class RolloutCollector:
         self.verifier = verifier
         self.rollout_length = max(1, int(rollout_length))
 
-    def _generate(self, active, captions, feedback_history, attempt_image_history, attempt_path_history, seed):
+    def _generate(self, captions, feedback_history, attempt_image_history,
+                  attempt_path_history, seed, init_latents=None):
         context_batch = {
-            "caption": [captions[idx] for idx in active],
-            "feedback_history": [list(feedback_history[idx]) for idx in active],
-            "attempt_images": [list(attempt_image_history[idx]) for idx in active],
-            "attempt_paths": [list(attempt_path_history[idx]) for idx in active],
+            "caption": list(captions),
+            "feedback_history": [list(history) for history in feedback_history],
+            "attempt_images": [list(images) for images in attempt_image_history],
+            "attempt_paths": [list(paths) for paths in attempt_path_history],
         }
         return self.model.generate(
             context_batch,
@@ -71,6 +72,8 @@ class RolloutCollector:
             cfg_scale=float(self.sampler_cfg.cfg_scale),
             ddim_eta=float(self.sampler_cfg.ddim_eta),
             seed=seed,
+            return_latents=True,      # store x_T so training can reuse the exact sampling noise
+            init_latents=init_latents,
         )
 
     @torch.no_grad()
@@ -113,58 +116,63 @@ class RolloutCollector:
                 gt_images[local_idx].save(gt_path)
                 gt_paths.append(str(gt_path))
 
-            active = list(range(batch_size))
             feedback_history = [[] for _ in range(batch_size)]
             attempt_image_history = [[] for _ in range(batch_size)]
             attempt_path_history = [[] for _ in range(batch_size)]
+            # One x_T per episode, drawn on the first step and reused for every later step: the only
+            # thing that changes between attempt_t and attempt_t+1 is the feedback, so the model
+            # learns to EDIT the image rather than resample a fresh one (fresh noise would make
+            # feedback indistinguishable from best-of-N).
+            episode_noise = None
 
             for step_idx in range(self.rollout_length):
-                if not active:
-                    break
-                step_seed = None if seed is None else int(seed) + base_attempted * self.rollout_length + step_idx
-                attempt_images = self._generate(
-                    active, captions, feedback_history, attempt_image_history, attempt_path_history, step_seed
+                step_seed = None if seed is None else int(seed) + base_attempted
+                attempt_images, attempt_latents = self._generate(
+                    captions, feedback_history, attempt_image_history, attempt_path_history,
+                    step_seed, init_latents=episode_noise,
                 )
-                sampled_attempts += len(active)
+                if episode_noise is None:
+                    # generate() hands back ONE CPU TENSOR PER ITEM (it persists them per record),
+                    # but init_latents is a batched tensor -- stack before feeding it back.
+                    episode_noise = torch.stack([latent.detach() for latent in attempt_latents])
+                sampled_attempts += batch_size
+
+                # Every item runs the full rollout_length -- a chain is never cut short, so the
+                # model also sees "already correct, no update" transitions and learns to hold them.
+                # The last attempt needs no feedback (nothing would consume it).
                 is_last = step_idx + 1 >= self.rollout_length
-                if is_last:
-                    results = None
-                    success_positions = list(range(len(active)))
-                else:
+                results = None
+                if not is_last:
                     results = self.verifier.verify(
-                        [captions[idx] for idx in active],
-                        [gt_images[idx] for idx in active],
-                        attempt_images,
-                        [list(feedback_history[idx]) for idx in active],
+                        captions, gt_images, attempt_images,
+                        [list(history) for history in feedback_history],
                     )
                     token_count += sum(int(result.token_count) for result in results)
-                    success_positions = [pos for pos, result in enumerate(results) if result.ok]
-                    failed += len(results) - len(success_positions)
+                    failed += sum(1 for result in results if not result.ok)   # verifier health only
 
-                next_active = []
-                for pos in success_positions:
-                    batch_idx = active[pos]
-                    feedback = results[pos].feedback if results is not None else ""
+                for idx in range(batch_size):
+                    # a verifier error just yields empty feedback; the chain continues either way
+                    feedback = results[idx].feedback if results is not None and results[idx].ok else ""
                     record_id = len(records)
                     attempt_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.png"
-                    attempt_images[pos].save(attempt_path)
+                    attempt_images[idx].save(attempt_path)
+                    # x_T that produced this attempt (~8KB fp16); training reuses it as the
+                    # flow-matching noise so the learned path matches inference.
+                    latent_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.pt"
+                    torch.save(attempt_latents[idx].to(torch.float16), latent_path)
                     records.append({
-                        "gt_path": gt_paths[batch_idx],
-                        "caption": captions[batch_idx],
-                        "feedback_history": list(feedback_history[batch_idx]),
-                        "attempt_paths": list(attempt_path_history[batch_idx]),
+                        "gt_path": gt_paths[idx],
+                        "caption": captions[idx],
+                        "feedback_history": list(feedback_history[idx]),
+                        "attempt_paths": list(attempt_path_history[idx]),
                         "attempt_path": str(attempt_path),
+                        "latent_path": str(latent_path),
                         "feedback": feedback,
                     })
                     if not is_last:
-                        feedback_history[batch_idx].append(feedback)
-                        attempt_image_history[batch_idx].append(attempt_images[pos])
-                        attempt_path_history[batch_idx].append(str(attempt_path))
-                        next_active.append(batch_idx)
-
-                active = next_active
-                if is_last or not active:
-                    break
+                        feedback_history[idx].append(feedback)
+                        attempt_image_history[idx].append(attempt_images[idx])
+                        attempt_path_history[idx].append(str(attempt_path))
 
             base_attempted += batch_size
             if progress is not None:
@@ -214,6 +222,35 @@ def exact_update_batches(loader, sampler, updates_per_step):
         epoch += 1
 
 
+class RepeatSampler(torch.utils.data.Sampler):
+    """Yield every index of a base sampler `repeats` times: several chains from one prompt.
+
+    Running N independent chains per caption is what gives the loss many DIFFERENT sources mapping
+    to the SAME target, which is what forces the critique to carry information rather than letting
+    the model reach the target from the caption alone. The repeats land next to each other in a
+    batch, and `generate` draws noise for the whole batch at once, so each replica still gets its
+    own x_T while the noise stays fixed WITHIN each chain.
+    """
+
+    def __init__(self, base, repeats):
+        self.base = base
+        self.repeats = max(int(repeats), 1)
+
+    def __iter__(self):
+        for index in self.base:
+            for _ in range(self.repeats):
+                yield index
+
+    def __len__(self):
+        return len(self.base) * self.repeats
+
+    def set_epoch(self, epoch):
+        # collect() calls set_epoch on whatever sampler it is given; forward it so reshuffling
+        # across outer iterations still happens.
+        if hasattr(self.base, "set_epoch"):
+            self.base.set_epoch(epoch)
+
+
 class OnPolicyTrainer:
     """Rollout -> verify -> distill loop with fixed-LR optimizers."""
 
@@ -240,6 +277,10 @@ class OnPolicyTrainer:
         eval,
         val_dataset=None,
         start_step=0,
+        resume=None,
+        eval_every=None,
+        curriculum=None,
+        caption_dropout_prob=0.0,
     ):
         from verifiers.eval_metrics import scorer_from_eval_cfg
 
@@ -261,8 +302,18 @@ class OnPolicyTrainer:
         self.ema_decay = float(ema_decay)
         self.log_every = int(log_every)
         self.ckpt_every = int(ckpt_every)
+        # defaults to ckpt_every so existing configs behave exactly as before
+        self.eval_every = int(eval_every) if eval_every else int(ckpt_every)
         self.eval_cfg = eval
         self.train_steps = self.start_step
+        # Index of the last COMPLETED outer iteration. Restored on resume because it seeds
+        # the rollout noise and the sampler epoch -- see learn().
+        self.outer_step = 0
+        # Curriculum: a list of {loops, length, weights, updates}. The active level is a pure
+        # function of outer_step, which save_backup() already persists and _restore() restores, so
+        # resuming mid-curriculum needs no extra state. None => the original fixed-length behaviour.
+        self.curriculum = [dict(level) for level in curriculum] if curriculum else None
+        self.caption_dropout_prob = float(caption_dropout_prob)
         self.cumulative_verifier_tokens = 0
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -288,14 +339,24 @@ class OnPolicyTrainer:
 
         self.params = model.trainable_parameters()
         self.opt, _ = build_optimizer_scheduler(self.params, lr=lr, weight_decay=weight_decay)
+        if resume:
+            self._restore(resume)
 
-        self.rollout_sampler = DistributedSampler(
+        base_rollout_sampler = DistributedSampler(
             dataset,
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
             seed=self.global_seed,
             drop_last=False,
+        )
+        # chains_per_prompt > 1 collects several independent chains per caption (see RepeatSampler).
+        # rollout.samples counts CHAINS, so `samples: 200` with chains_per_prompt 4 is 50 captions.
+        chains_per_prompt = int(getattr(rollout, "chains_per_prompt", 1) or 1)
+        self.chains_per_prompt = chains_per_prompt
+        self.rollout_sampler = (
+            RepeatSampler(base_rollout_sampler, chains_per_prompt)
+            if chains_per_prompt > 1 else base_rollout_sampler
         )
         self.rollout_loader = DataLoader(
             dataset,
@@ -309,6 +370,7 @@ class OnPolicyTrainer:
             ),
         )
         self.pin_memory = bool(dataloader.pin_memory)
+        self.num_workers = int(dataloader.num_workers)
         self.logger.info(f"Dataset contains {len(dataset):,} rows.")
 
     @contextmanager
@@ -329,16 +391,52 @@ class OnPolicyTrainer:
         finally:
             module.load_state_dict(saved_weights)
 
+    def level_for(self, outer_step):
+        """The curriculum level a 1-based outer iteration falls in, or None without a curriculum.
+
+        Derived from outer_step alone, so a resumed run lands back in the right level with no extra
+        state to save or restore.
+        """
+        if not self.curriculum:
+            return None
+        seen = 0
+        for level in self.curriculum:
+            seen += int(level["loops"])
+            if outer_step <= seen:
+                return level
+        return self.curriculum[-1]
+
     def learn(self):
-        outer_total = (self.max_train_steps + self.updates_per_rollout - 1) // self.updates_per_rollout
-        for outer_step in progress_bar(range(1, outer_total + 1), total=outer_total, desc="on-policy steps"):
+        # outer_step CONTINUES across a resume rather than restarting at 1. It is not just a label:
+        # collect() derives the rollout noise seed from it (global_seed + outer_step * 1e6 + rank)
+        # and passes it as the sampler epoch. Restarting it would make every requeue replay the
+        # same x_T draws and the same prompt order as the start of the run -- on a preemptable
+        # partition that silently collapses the noise distribution the run actually sees.
+        if self.curriculum:
+            # The curriculum fixes the loop count outright; max_train_steps is only a backstop.
+            last_outer = sum(int(level["loops"]) for level in self.curriculum)
+            outer_range = range(self.outer_step + 1, last_outer + 1)
+        else:
+            remaining = max(self.total_steps - self.train_steps, 0)
+            outer_total = (remaining + self.updates_per_rollout - 1) // self.updates_per_rollout
+            first = self.outer_step + 1
+            outer_range = range(first, first + outer_total)
+        for outer_step in progress_bar(outer_range, total=len(outer_range),
+                                       desc="on-policy steps"):
+            level = self.level_for(outer_step)
+            if level is not None:
+                # Growing chain length is the curriculum: short chains first, so the model learns a
+                # single repair before being asked to compose three.
+                self.collector.rollout_length = int(level["length"])
             stats, step_dir = self.collect(outer_step)
             dist.barrier()
+            self.outer_step = outer_step
             if stats["success"] == 0:
                 self.logger.info(f"Skipping outer={outer_step}: no successful rollout rows.")
                 dist.barrier()
                 continue
             self.update(outer_step, step_dir)
+            self.save_backup()
             if self.train_steps >= self.total_steps:
                 break
         self.logger.info("Done!")
@@ -350,6 +448,7 @@ class OnPolicyTrainer:
         collect_progress = progress_bar(total=local_samples, desc=f"collect {outer_step:06d}")
         rollout_start = time()
         with self._ema_weights():
+            self.log_on_policy_grid(outer_step)
             stats = self.collector.collect(
                 self.rollout_loader,
                 shard_dir,
@@ -394,12 +493,18 @@ class OnPolicyTrainer:
     def update(self, outer_step, step_dir):
         buffer_dataset = RolloutBuffer(step_dir)
         update_batch_size = min(self.local_batch_size, len(buffer_dataset))
+        level = self.level_for(outer_step)
+        # Per-level update count holds the epochs-per-rollout constant as chains (and so record
+        # counts) grow across levels.
+        n_updates = int(level["updates"]) if level else self.updates_per_rollout
+        # Weight by chain position: later attempts, the ones we actually want correct, count more.
+        pos_weights = [float(w) for w in level["weights"]] if level else None
         self.log_rollout_samples(buffer_dataset, outer_step)
         if rank_is_zero():
             wandb.log({"rollout/buffer_rows": len(buffer_dataset)}, step=self.train_steps)
         self.logger.info(
             f"Training outer={outer_step:06d}: {len(buffer_dataset)} rollout rows, "
-            f"batch size {update_batch_size} per rank, {self.updates_per_rollout} updates."
+            f"batch size {update_batch_size} per rank, {n_updates} updates."
         )
         buffer_sampler = DistributedSampler(
             buffer_dataset,
@@ -414,19 +519,27 @@ class OnPolicyTrainer:
             batch_size=update_batch_size,
             shuffle=False,
             sampler=buffer_sampler,
-            num_workers=0,
+            num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=rollout_collate,
             drop_last=False,
+            **({"prefetch_factor": 4, "persistent_workers": True} if self.num_workers > 0 else {}),
         )
-        running = {key: 0.0 for key in ("loss", "grad_norm")}
+        running = {key: 0.0 for key in ("loss", "grad_norm", "mean_weight", "caption_dropped")}
         log_steps = 0
         log_start = time()
         self.model.net.train()
-        batches = exact_update_batches(buffer_loader, buffer_sampler, self.updates_per_rollout)
-        for batch in progress_bar(batches, total=self.updates_per_rollout, desc=f"updates {outer_step:06d}"):
+        batches = exact_update_batches(buffer_loader, buffer_sampler, n_updates)
+        for batch in progress_bar(batches, total=n_updates, desc=f"updates {outer_step:06d}"):
             self.opt.zero_grad()
-            loss = self.model.rollout_loss(batch)
+            weights = None
+            if pos_weights is not None:
+                # chain_pos can exceed the level's chain length only if a buffer from a longer
+                # level were reused; clamp rather than crash.
+                weights = [pos_weights[min(int(p), len(pos_weights) - 1)]
+                           for p in batch["chain_pos"]]
+            loss = self.model.rollout_loss(
+                batch, weights=weights, caption_dropout_prob=self.caption_dropout_prob)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.params, self.grad_clip)
             grad_norm_avg = all_reduce_scalar(float(grad_norm.item()), self.device) / self.world_size
@@ -435,6 +548,10 @@ class OnPolicyTrainer:
 
             running["loss"] += float(loss.item())
             running["grad_norm"] += float(grad_norm_avg)
+            running["mean_weight"] += (sum(weights) / len(weights)) if weights else 1.0
+            n_feedback_rows = sum(1 for p in batch["chain_pos"] if int(p) > 0)
+            running["caption_dropped"] += (
+                getattr(self.model, "last_caption_dropped", 0) / max(n_feedback_rows, 1))
             log_steps += 1
             self.train_steps += 1
 
@@ -446,27 +563,99 @@ class OnPolicyTrainer:
                 avg = {key: float(value.item()) / denom for key, value in zip(keys, values)}
                 elapsed = max(time() - log_start, 1e-6)
                 if rank_is_zero():
-                    wandb.log({
+                    payload = {
                         "train/loss": avg["loss"],
                         "train/grad_norm": avg["grad_norm"],
                         "train/lr": self.opt.param_groups[0]["lr"],
                         "train/steps_per_sec": log_steps / elapsed,
                         "train/outer_step": outer_step,
-                    }, step=self.train_steps)
+                    }
+                    if level is not None:
+                        # mean_weight should read ~1.0 at every level -- it is the direct check that
+                        # the per-level weights were rescaled correctly and that the curriculum is
+                        # not silently changing the gradient scale between levels.
+                        payload["train/level"] = self.curriculum.index(level) + 1
+                        payload["train/chain_length"] = int(level["length"])
+                        payload["train/mean_weight"] = avg["mean_weight"]
+                    if self.caption_dropout_prob > 0.0:
+                        payload["train/caption_dropped_frac"] = avg["caption_dropped"]
+                    wandb.log(payload, step=self.train_steps)
                 running = {key: 0.0 for key in running}
                 log_steps = 0
                 log_start = time()
 
-            if self.train_steps % self.ckpt_every == 0:
+            # eval and checkpointing are decoupled: eval every rollout (cheap, gives the TTS curve),
+            # save far less often (each checkpoint is ~1GB of LoRA weights).
+            if self.train_steps % self.eval_every == 0:
                 eval_tokens = self.eval_step()
                 if rank_is_zero() and eval_tokens:
                     self.cumulative_verifier_tokens += int(eval_tokens)
                     wandb.log({"verifier/total_tokens": self.cumulative_verifier_tokens}, step=self.train_steps)
+                dist.barrier()
+            if self.train_steps % self.ckpt_every == 0:
                 self.save()
                 dist.barrier()
 
             if self.train_steps >= self.total_steps:
                 break
+
+    @torch.no_grad()
+    def log_on_policy_grid(self, outer_step, history=5):
+        """Drift probe, run at the start of every rollout: render the SAME val prompts from the SAME
+        noise with the current rollout policy, then plot prompts x last-`history` rollouts so policy
+        drift is visible at a glance. Caller holds the EMA context, matching what rollouts sample."""
+        if not rank_is_zero() or self.val_dataset is None or len(self.val_dataset) == 0:
+            return
+        count = min(int(self.rollout_cfg.log_samples), 8, len(self.val_dataset))
+        if count <= 0:
+            return
+        captions = [self.val_dataset[idx]["caption"] for idx in range(count)]
+        gt_images = [self.val_dataset.image_for_index(idx) for idx in range(count)]
+        images = self.model.generate(
+            {
+                "caption": captions,
+                "feedback_history": [[] for _ in captions],
+                "attempt_images": [[] for _ in captions],
+                "attempt_paths": [[] for _ in captions],
+            },
+            num_sampling_steps=int(self.sampler_cfg.num_sampling_steps),
+            cfg_scale=float(self.sampler_cfg.cfg_scale),
+            ddim_eta=float(self.sampler_cfg.ddim_eta),
+            seed=self.global_seed,  # fixed noise: differences across columns are pure policy drift
+        )
+        grid_dir = self.log_dir / "on_policy_grid"
+        grid_dir.mkdir(parents=True, exist_ok=True)
+        for idx, image in enumerate(images):
+            image.save(grid_dir / f"outer_{outer_step:06d}_p{idx:02d}.png")
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        outers = sorted({int(p.name.split("_")[1]) for p in grid_dir.glob("outer_*_p00.png")})[-int(history):]
+        cols = 1 + len(outers)  # col 0 = GT render of the prompt, then the last `history` rollout policies
+        fig, axes = plt.subplots(count, cols, figsize=(2.4 * cols, 2.6 * count), squeeze=False)
+        for row in range(count):
+            axes[row][0].imshow(gt_images[row])
+            if row == 0:
+                axes[row][0].set_title("GT", fontsize=9)
+            for col, outer in enumerate(outers, start=1):
+                ax = axes[row][col]
+                path = grid_dir / f"outer_{outer:06d}_p{row:02d}.png"
+                if path.exists():
+                    ax.imshow(plt.imread(path))
+                if row == 0:
+                    ax.set_title(f"outer {outer}", fontsize=9)
+            for col in range(cols):
+                axes[row][col].set_xticks([])
+                axes[row][col].set_yticks([])
+        fig.suptitle("on-policy drift: fixed prompts / fixed noise, first-step generations", fontsize=10)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig.savefig(grid_dir / "on_policy_grid.png", dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        wandb.log({"rollout/on_policy_grid": wandb.Image(str(grid_dir / "on_policy_grid.png"))},
+                  step=self.train_steps)
 
     def log_rollout_samples(self, buffer_dataset, outer_step):
         if not rank_is_zero():
@@ -510,30 +699,141 @@ class OnPolicyTrainer:
         if not rank_is_zero() or self.val_dataset is None or len(self.val_dataset) == 0:
             return 0
         start_idx = int(self.eval_cfg.caption_index)
-        batch_size = max(1, int(self.eval_cfg.batch_size))
+        # batch_size <= 0 evaluates the ENTIRE val split (test-time-scaling curve over all prompts).
+        batch_size = int(self.eval_cfg.batch_size)
+        batch_size = len(self.val_dataset) if batch_size <= 0 else max(1, batch_size)
         indices = [(start_idx + offset) % len(self.val_dataset) for offset in range(batch_size)]
         captions = [self.val_dataset[idx]["caption"] for idx in indices]
         gt_images = [self.val_dataset.image_for_index(idx) for idx in indices]
 
-        traces, _histories, eval_tokens = adaptive_eval(
-            self.model,
-            self.verifier,
-            captions,
-            gt_images,
-            steps=max(1, int(self.eval_cfg.steps)),
-            seed=int(self.eval_cfg.seed) + self.train_steps * 1000,
-            scorer=self.scorer,
-            sampler_cfg=self.sampler_cfg,
-        )
+        # Chunked: adaptive_eval generates every prompt in ONE batch, so large eval sets must be
+        # split to stay inside generation memory (64/rank is the proven limit).
+        chunk = int(getattr(self.eval_cfg, "gen_batch", 32))
+        traces = []
+        eval_tokens = 0
+        for lo in range(0, len(captions), chunk):
+            chunk_traces, _histories, chunk_tokens = adaptive_eval(
+                self.model,
+                self.verifier,
+                captions[lo:lo + chunk],
+                gt_images[lo:lo + chunk],
+                steps=max(1, int(self.eval_cfg.steps)),
+                seed=int(self.eval_cfg.seed) + self.train_steps * 1000 + lo,
+                scorer=self.scorer,
+                sampler_cfg=self.sampler_cfg,
+            )
+            traces.extend(chunk_traces)
+            eval_tokens += chunk_tokens
 
         grid_path = self.log_dir / "adaptive_eval" / f"step_{self.train_steps:07d}.png"
         metrics = {}
-        if save_adaptive_trace_grid(grid_path, traces, gt_images, captions) is not None:
+        grid_n = min(len(traces), 16)  # the metrics use every trace; the image grid only needs a sample
+        if save_adaptive_trace_grid(grid_path, traces[:grid_n], gt_images[:grid_n], captions[:grid_n]) is not None:
             metrics["eval/adaptive_traces"] = wandb.Image(str(grid_path))
         for key, value in distance_metrics(traces).items():
             metrics[f"eval/{key}"] = value
+
+        # Test-time-scaling curve: mean eval score (+/- standard error) at each rollout step, over the
+        # evaluated prompts. Shows whether extra feedback steps keep buying image quality.
+        by_step = {}
+        for trace in traces:
+            for step, entry in enumerate(trace):
+                if entry["distance"] is not None:
+                    by_step.setdefault(step, []).append(float(entry["distance"]))
+        if by_step:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            steps_axis = sorted(by_step)
+            means = [sum(by_step[s]) / len(by_step[s]) for s in steps_axis]
+            stderrs = [
+                (sum((v - m) ** 2 for v in by_step[s]) / max(len(by_step[s]) - 1, 1)) ** 0.5
+                / max(len(by_step[s]), 1) ** 0.5
+                for s, m in zip(steps_axis, means)
+            ]
+            fig, ax = plt.subplots(figsize=(5, 3.5))
+            ax.errorbar(steps_axis, means, yerr=stderrs, marker="o", capsize=3)
+            ax.set_xlabel("rollout step")
+            ax.set_ylabel("mean score (higher = better)")
+            ax.set_xticks(steps_axis)
+            ax.set_title(f"test-time scaling (n={len(traces)} prompts)")
+            ax.grid(alpha=0.3)
+            tts_path = self.log_dir / "adaptive_eval" / f"tts_{self.train_steps:07d}.png"
+            fig.tight_layout()
+            fig.savefig(tts_path, dpi=140)
+            plt.close(fig)
+            metrics["eval/test_time_scaling"] = wandb.Image(str(tts_path))
+            for s, m, se in zip(steps_axis, means, stderrs):
+                metrics[f"eval/tts_step_{s}_stderr"] = se
+
         wandb.log(metrics, step=self.train_steps)
         return eval_tokens
+
+    def _restore(self, path):
+        """Resume optimizer/EMA/step from a checkpoint written by save().
+
+        train.py already restores the *model* weights from the same file; without this the
+        optimizer moments and EMA silently cold-start on every preemption, and train_steps resets.
+        `max_train_steps` stays an absolute target, so a resumed run stops where it would have.
+        """
+        payload = torch.load(path, map_location="cpu")
+        if "opt" in payload:
+            self.opt.load_state_dict(payload["opt"])
+        if "ema" in payload:
+            if self.model.lora_finetune:
+                from peft import set_peft_model_state_dict
+                set_peft_model_state_dict(self.ema, payload["ema"])
+            else:
+                self.ema.load_state_dict(payload["ema"], strict=False)
+        if "train_steps" in payload:
+            self.train_steps = int(payload["train_steps"])
+            self.start_step = self.train_steps
+        # Older checkpoints predate these keys; defaulting to 0 reproduces the previous behaviour.
+        self.outer_step = int(payload.get("outer_step", 0))
+        self.cumulative_verifier_tokens = int(payload.get("verifier_tokens", 0))
+        rng = payload.get("torch_rng")
+        if rng is not None:
+            torch.set_rng_state(rng.to(torch.uint8) if hasattr(rng, "to") else rng)
+        self.logger.info(
+            f"Resumed from {path}: train_steps={self.train_steps} outer_step={self.outer_step} "
+            f"(opt={'opt' in payload}, ema={'ema' in payload}, rng={rng is not None}), "
+            f"target={self.total_steps}")
+
+    def save_backup(self):
+        """Rolling latest-only resume point, written after every outer iteration.
+
+        Numbered checkpoints are milestones (kept, every ckpt_every steps); this is the thing a
+        requeue actually resumes from, so it is written far more often and overwritten in place --
+        one file, constant disk. It carries everything `learn()` needs to continue where it stopped:
+        LoRA weights, EMA, optimizer moments, train_steps, the outer-iteration counter (which seeds
+        the rollout noise), the verifier token tally, and the torch RNG state.
+
+        The wandb run id travels in a separate one-line sidecar so train.py can re-attach to the
+        same run BEFORE building the trainer, without loading a multi-GB file to read one string.
+        """
+        if not rank_is_zero():
+            return
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model": self.model.checkpoint_state(),
+            "ema": self.model.lora_state_of(self.ema),
+            "opt": self.opt.state_dict(),
+            "train_steps": self.train_steps,
+            "outer_step": self.outer_step,
+            "verifier_tokens": self.cumulative_verifier_tokens,
+            "torch_rng": torch.get_rng_state(),
+        }
+        encoder_state = self.model.encoder_state()
+        if encoder_state is not None:
+            payload["context_encoder"] = encoder_state
+        save_checkpoint_atomic(payload, self.log_dir / "resume.bkp")
+        run_id = getattr(getattr(wandb, "run", None), "id", None)
+        if run_id:
+            (self.log_dir / "wandb_run_id.txt").write_text(str(run_id))
+        self.logger.info(
+            f"Backup written at step={self.train_steps} outer={self.outer_step}")
 
     def save(self):
         if not rank_is_zero():
@@ -541,14 +841,18 @@ class OnPolicyTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "model": self.model.checkpoint_state(),
-            "ema": self.ema.state_dict(),
+            "ema": self.model.lora_state_of(self.ema),
             "opt": self.opt.state_dict(),
             "train_steps": self.train_steps,
+            "outer_step": self.outer_step,
+            "verifier_tokens": self.cumulative_verifier_tokens,
+            "torch_rng": torch.get_rng_state(),
         }
         encoder_state = self.model.encoder_state()
         if encoder_state is not None:
             payload["context_encoder"] = encoder_state
         checkpoint_path = self.checkpoint_dir / f"{self.train_steps:07d}.pt"
         save_checkpoint_atomic(payload, checkpoint_path)
-        save_checkpoint_atomic(self.ema.state_dict(), self.checkpoint_dir / f"{self.train_steps:07d}-ema.pt")
+        save_checkpoint_atomic(self.model.lora_state_of(self.ema),
+                               self.checkpoint_dir / f"{self.train_steps:07d}-ema.pt")
         self.logger.info(f"Saved checkpoint at step={self.train_steps}")

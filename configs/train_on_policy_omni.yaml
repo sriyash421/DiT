@@ -8,12 +8,13 @@ hydra:
     chdir: false
 
 verifier:
-  api_url: http://g3114:8000/v1
-  workers: 50
+  api_url: http://g3102:8000/v1
+  workers: 100
 
-ckpt: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_lora_finetune/checkpoints/0010000.pt
+ckpt: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_lora_finetune_five_objects/checkpoints/0010000.pt
+ckpt_use_ema: true  # the raw "model" state of this checkpoint generates garbage; its EMA state is the validated one
 results_dir: /gscratch/scrubbed/sriyash/omni-clevr-on-policy
-experiment_name: on_policy_omni_l4_final
+experiment_name: on_policy_five_objects_9b_verifier_ema
 
 dataset:
   image_size: 256
@@ -58,22 +59,22 @@ trainer:
     cfg_scale: 1.0
     ddim_eta: 0.0
   rollout:
-    samples: 2048
+    samples: 1024
     length: 4
     use_ema: true
     storage_dir: null
     log_samples: 8
-    batch_size: 256
+    batch_size: 128
   lr: 1e-5
   weight_decay: 0.0
   global_batch_size: 32
   global_seed: 0
-  updates_per_rollout: 200
+  updates_per_rollout: 512
   max_train_steps: 50000
   grad_clip: 1.0
-  ema_decay: 0.99
+  ema_decay: 0.999
   log_every: 50
-  ckpt_every: 500
+  ckpt_every: 1024  # updates_per_rollout(512) * 2 rollouts, per user request
   dataloader:
     num_workers: 8
     pin_memory: true
@@ -82,7 +83,7 @@ trainer:
     drop_last: true
   eval:
     caption_index: 42
-    batch_size: 8
+    batch_size: 64
     seed: 0
     steps: 4
 

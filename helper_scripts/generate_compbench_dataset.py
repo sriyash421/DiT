@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -27,8 +28,70 @@ def fetch_prompts(category, split, cache_dir):
     path = cache_dir / f"{category}_{split}.txt"
     if not path.exists():
         cache_dir.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(PROMPT_URL.format(category=category, split=split), path)
+        # Cluster nodes lack a system CA bundle, so stdlib urllib fails SSL verification; use certifi.
+        import ssl
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(PROMPT_URL.format(category=category, split=split), context=ctx) as r:
+            path.write_bytes(r.read())
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def openrouter_candidates(model, prompt, n, workers, timeout=300, retries=7):
+    """Generate n candidates for one prompt via OpenRouter, concurrently.
+
+    These are blocking HTTP calls, so serialising them wastes almost all the wall clock: measured
+    44.5s/call serial vs 1.7s/image amortised at 32-way concurrency (26x). Retries cover 429/5xx,
+    which do occur at this concurrency.
+    """
+    import base64
+    import io
+    import ssl
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import certifi
+    from PIL import Image as PILImage
+
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+
+    def one(_):
+        payload = {"model": model, "modalities": ["image", "text"],
+                   "messages": [{"role": "user",
+                                 "content": f"Generate a photograph showing exactly: {prompt}"}]}
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+        for attempt in range(retries):
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    msg = json.loads(r.read())["choices"][0]["message"]
+                out = []
+                for im in (msg.get("images") or []):
+                    url = (im.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:"):
+                        out.append(PILImage.open(
+                            io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB"))
+                return out
+            except urllib.error.HTTPError as e:
+                if e.code in (408, 409, 429, 500, 502, 503, 504, 529):
+                    time.sleep(min(2 ** attempt * 3, 90))
+                    continue
+                print(f"      HTTP {e.code}: {e.read()[:160]}", flush=True)
+                return []
+            except Exception as e:
+                if attempt == retries - 1:
+                    print(f"      gave up: {type(e).__name__}: {str(e)[:160]}", flush=True)
+                time.sleep(min(2 ** attempt * 2, 60))
+        return []
+
+    imgs = []
+    with ThreadPoolExecutor(max_workers=min(workers, n)) as ex:
+        for got in ex.map(one, range(n)):
+            imgs.extend(got)
+    return imgs[:n]
 
 
 def save_atomic(image, path, size):
@@ -59,9 +122,15 @@ def generate_candidates(pipe, prompt, n, batch_size, seed, steps, guidance, size
 
 
 def load_done(manifest_path):
+    """Union over EVERY shard manifest, not just this shard's.
+
+    Sharding is positional (i % num_shards), so re-running with a different --num-shards remaps
+    prompts to different shards. Reading only this shard's manifest would then miss work another
+    shard already did and silently pay to generate it again.
+    """
     done = set()
-    if manifest_path.exists():
-        for line in manifest_path.read_text().splitlines():
+    for path in sorted(manifest_path.parent.glob("manifest_*.jsonl")):
+        for line in path.read_text().splitlines():
             if line.strip():
                 row = json.loads(line)
                 done.add((row["category"], row["split"], row["prompt_index"]))
@@ -103,16 +172,32 @@ def main(args):
                 }) + "\n")
                 manifest.flush()
                 continue
-            if pipe is None:
+            if scorer is None:
                 import torch
-                from diffusers import FluxPipeline
-
-                pipe = FluxPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16).to("cuda")
-                scorer = CompBenchEval(device="cuda")
-            candidates = generate_candidates(
-                pipe, prompt, args.n_candidates, args.gen_batch_size,
-                args.seed + idx * args.n_candidates, args.steps, args.guidance, args.gen_size,
-            )
+                if args.backend == "flux":
+                    from diffusers import FluxPipeline
+                    pipe = FluxPipeline.from_pretrained(args.model,
+                                                        torch_dtype=torch.bfloat16).to("cuda")
+                detector = None
+                if any(c in ("spatial", "3d_spatial", "numeracy") for c in args.categories):
+                    # Open-vocab Grounding DINO scorer (replaces UniDet's closed 722-class taxonomy).
+                    from verifiers.gdino_numeracy import GDinoNumeracyScorer
+                    # min(gdino, owlv2): exact-count 79.0% -> 85.2% on 81 hand-labelled images
+                    detector = GDinoNumeracyScorer(model_name=args.gdino_model, device="cuda",
+                                                   owlv2_min=True)
+                scorer = CompBenchEval(device="cuda", use_unidet=bool(detector), unidet_scorer=detector)
+            if args.backend == "openrouter":
+                candidates = openrouter_candidates(args.api_model, prompt, args.n_candidates,
+                                                   args.api_workers)
+                if not candidates:
+                    print(f"  no candidates for '{prompt}' -- skipping (will retry on requeue)",
+                          flush=True)
+                    continue
+            else:
+                candidates = generate_candidates(
+                    pipe, prompt, args.n_candidates, args.gen_batch_size,
+                    args.seed + idx * args.n_candidates, args.steps, args.guidance, args.gen_size,
+                )
             # Prompt-level atomic: save all images, then write all manifest lines at once. A
             # preemption mid-prompt leaves no manifest lines, so the whole prompt is redone on requeue
             # (never a half-set silently marked done).
@@ -144,4 +229,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--backend", choices=["flux", "openrouter"], default="flux",
+                        help="flux = local diffusers; openrouter = hosted API (no GPU for generation)")
+    parser.add_argument("--api-model", type=str, default="openai/gpt-5-image-mini",
+                        help="OpenRouter image model. gpt-5-image-mini measured best AND cheapest: "
+                             "exact-count 0.88 vs 0.55 for FLUX.1-dev on the 10 hardest prompts.")
+    parser.add_argument("--api-workers", type=int, default=32)
+    parser.add_argument("--gdino-model", type=str, default="IDEA-Research/grounding-dino-base",
+                        help="Open-vocab Grounding DINO checkpoint used to score "
+                             "spatial/3d_spatial/numeracy candidates.")
     main(parser.parse_args())

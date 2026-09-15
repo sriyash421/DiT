@@ -9,7 +9,10 @@ Runs in .venv-omni (OmniGen generation + OpenRouter scoring). Collate with colla
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: algorithms/, verifiers/
 
 import hydra
 import torch
@@ -20,11 +23,13 @@ torch.backends.cudnn.allow_tf32 = True
 from omegaconf import OmegaConf
 
 from algorithms.eval import select_eval_batch
-from verifiers.base import score_structured_breakdown
 from verifiers.open_router import OpenRouterVerifier
 
-SPLIT_SEED_OFFSET = {"train": 0, "val": 10_000_000}
-SUBMETRICS = ("combined", "content", "presence", "shape", "color", "extra")
+SPLIT_SEED_OFFSET = {"train": 0, "val": 10_000_000, "test": 20_000_000}
+# Enumeration metric (higher=better, all in [0,1]): score is the reward (0.5 shape + 0.5 color per
+# expected object, blur-discounted, averaged over expected objects); presence/shape/color are the
+# per-attribute accuracies; quality is the crisp (non-blurry) fraction of matched objects.
+SUBMETRICS = ("score", "presence", "shape", "color", "quality", "precision")
 
 
 def build_units(steps, splits, num_prompts):
@@ -63,11 +68,12 @@ def generate_samples(model, caption, context_row, context_mask_row, args, base_s
 
 
 def score_samples(scorer, caption, images):
+    # Enumeration mode: score_distance -> each result carries .breakdown (enumeration_breakdown dict).
     results = scorer.score_distance([caption] * len(images), [None] * len(images), images)
     samples = []
     for s, r in enumerate(results):
-        row = {"sample": s, "ok": bool(r.ok and r.score is not None)}
-        breakdown = score_structured_breakdown(r.feedback, caption) if r.ok else None
+        breakdown = r.breakdown if (r.ok and r.breakdown is not None) else None
+        row = {"sample": s, "ok": bool(r.ok and breakdown is not None)}
         for key in SUBMETRICS:
             row[key] = (breakdown[key] if breakdown is not None else None)
         samples.append(row)
@@ -99,8 +105,15 @@ def main():
 
     ds0, _ = get_prompts(my_units[0][1])
     model = hydra.utils.instantiate(cfg.model, context_dim=ds0.context_dim, device=device)
-    scorer = OpenRouterVerifier(model=args.scorer_model, temperature=0.0, max_tokens=1024,
-                                workers=args.score_workers, timeout=120)
+    if args.scorer == "clevr_detector":
+        # VLM-free local scorer (GDino + learned CLIP-probe shape + HSV color); shares the GPU with OmniGen.
+        from verifiers.detector_clevr import ClevrDetectorVerifier
+        # use_owl=False: with the learned probe it is both more accurate (exact 0.94 vs 0.91) and avoids
+        # OWLv2's scipy dependency (absent from .venv-omni).
+        scorer = ClevrDetectorVerifier(device="cuda", use_owl=False)
+    else:
+        scorer = OpenRouterVerifier(model=args.scorer_model, temperature=0.0, max_tokens=1024,
+                                    workers=args.score_workers, timeout=120, use_enumeration=True)
 
     loaded_step = None
     done = 0
@@ -146,6 +159,8 @@ def parse_args():
     p.add_argument("--num_samples", type=int, default=64)
     p.add_argument("--shard", type=int, required=True)
     p.add_argument("--num_shards", type=int, default=64)
+    p.add_argument("--scorer", default="openrouter", choices=["openrouter", "clevr_detector"],
+                   help="openrouter = VLM enumeration scorer; clevr_detector = local GDino+CLIP-probe+HSV scorer.")
     p.add_argument("--scorer_model", default="z-ai/glm-4.6v")
     p.add_argument("--score_workers", type=int, default=16)
     p.add_argument("--batch_size", type=int, default=16)

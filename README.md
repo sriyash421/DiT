@@ -93,6 +93,39 @@ the number of predictions per rollout: length K makes K predictions and asks for
 generated attempt k — caption-only at depth 0, caption + k feedback/attempt pairs after that.
 On-policy launches also need `OPENROUTER_API_KEY` for the hardcoded eval distance scorer.
 
+### On-policy LR: use the offline LR, not PPO's
+
+The numeracy on-policy run was first configured at `lr: 1e-5`, chosen to sit inside the PPO
+convention band (1e-5..5e-5). That was the wrong reference class and it cost ~270 iterations:
+
+| | offline run (learned) | on-policy run (near-frozen) |
+| --- | --- | --- |
+| lr | **1e-4** | **1e-5** |
+| global_batch_size | 32 | 64 |
+| lora rank / alpha | 128 / 128 | 128 / 128 |
+
+Identical adapter, 10x lower LR — and the result was +0.01 dense score over 272 iterations, with
+the fixed-prompt/fixed-noise drift grid showing visually frozen generations.
+
+PPO uses small LRs because the policy-gradient estimator is high-variance. This loop is **supervised
+distillation**: the target is the ground-truth image, so the objective is the same flow-matching loss
+as offline training. Anchor the LR to the offline run that worked, not to RL convention.
+
+Current recommendation for on-policy configs:
+
+- `lr: 1e-4` — match the offline stage.
+- `updates_per_rollout: 64` — 2 epochs over the rollout buffer. Staleness is safe here for the same
+  reason: the target is the GT image, so reusing rollouts does not bias the objective the way it
+  would in off-policy RL (no importance weighting needed).
+- Keep `stored_noise_prob: 1.0` and `rollout.length >= 4`. With fresh noise per step the model
+  resamples instead of editing; the length-2 / fresh-noise run *declined* across rollout steps
+  (0.714 -> 0.685), whereas fixed within-sequence noise at length 4 gives +0.009 from step 0 -> 3.
+
+Before reaching for full finetuning to fix a stalled run, check the LR first, then run a capacity
+probe (overfit ~32 prompts to convergence). Rank-128 LoRA on qkv/o/gate_up/down is 201M trainable
+params — 5.6% of the transformer matrices — and already moved the base model to 0.742 dense offline,
+so adapter capacity is rarely the binding constraint.
+
 ## Evaluation
 
 ```bash
@@ -114,3 +147,25 @@ pytest test.py -q                          # + integration (CUDA, GEMINI_API_KEY
 
 `job_*.sh` are the slurm launchers (train, on-policy, feedback generation, evals, and the vLLM server
 used by the `vllm_qwen` verifier). See `NOTES.md` for remaining oddities and intentional decisions.
+
+
+now run a big test: so run this test: use the original prompt v1, best prompt v1, and v2 and v3. for models : qwen3.5-9B (with and without thinking), qwen3.5-27B (with and without thinking), qwen3.6-27B
+  with and without thinking. so 4 prompts x 6 models. host the three models on 3x2 l40s simultaneously and run the 24 evals on ckpt partition! for ground truth verify each models predictions by using anthropic claude fable 5 on open router to get the ground truth! run the eval on 64 images each! generate images using the 100k chgeckpoint for this model: /gscratch/scrubbed/sriyash/OmniGen-clevr/omni_lora_finetune_five_objects on the 64 images in the val set. get the ground truth response using the claude model. and then compare the responses to the 24 images and present evereyrhing in a verifier_report.MD . the verifier should contain tables, explainations and some images to point behavior that i should look at! and also plots and figures to make me understand the comparison better. the goal is to compare performance in terms of accuracy, speed, throuhgput, output tokens, and other metrics useful for knowing which model to use for on-policy feedback generartion. given below are the recomended sampling parameters. strictly use them. also for thiking models set a higher token output length to avoid truncating the output! 
+  for qwen3.6 model family:
+  Sampling Parameters:
+
+We suggest using the following sets of sampling parameters depending on the mode and task type:
+Thinking mode for general tasks:
+temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0
+Instruct (or non-thinking) mode:
+temperature=0.7, top_p=0.80, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0
+
+
+for qwen3.5 model family:
+Sampling Parameters:
+
+We suggest using the following sets of sampling parameters depending on the mode and task type:
+Thinking mode for general tasks:
+temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0
+Instruct (or non-thinking) mode for general tasks:
+temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0

@@ -1,9 +1,16 @@
 _target_: verifiers.vllm_qwen.VLLMQwenVerifier
 api_url: http://localhost:8000/v1
 api_key: EMPTY
-model: Qwen/Qwen3.5-27B
-temperature: 0.0
-max_tokens: 64
+# Qwen3.5-9B + caption-free enumeration ("v5_code"): best accuracy-per-cost in the verifier benchmark
+# (78% direction accuracy vs best-of-4 Fable GT at n=256, ~0.7s / ~28 tokens per call). Sampling follows
+# the Qwen3.5 instruct model-card recommendation, as benchmarked. See results/verifier_bench.
+model: Qwen/Qwen3.5-9B
+use_enumeration: true
+temperature: 0.7
+top_p: 0.8
+top_k: 20
+presence_penalty: 1.5
+max_tokens: 192
 retries: 2
 timeout: 180
 workers: 64

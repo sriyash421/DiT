@@ -1,0 +1,20 @@
+# clevr_g6 variant of the VLM-free CLEVR verifier: same detector stack, but (a) the shape probe
+# retrained on this dataset's own crops (the shipped probe reads cylinders as cubes at this object
+# size -- shape 0.873 vs 1.000 on held-out g6 crops), and (b) cell-aware, so a scene with the right
+# objects in the wrong cells is penalised and gets a "move ... to cell N" edit instead of "no update".
+# Placement is 35% of this model's held-out failure mass, so without cell_centres a third of the
+# rollouts would train on an actively wrong signal.
+_target_: verifiers.detector_clevr.ClevrDetectorVerifier
+device: cuda
+probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt
+use_probe: true
+use_owl: false
+box_threshold: 0.25
+text_threshold: 0.25
+nms_iou: 0.5
+blur_thresh: 50.0
+# Measured from ground-truth renders: exact, std 0.00 px, 72 px apart.
+# Order: front row L,M,R (y=194) then back row L,M,R (y=58).
+cell_centres: [[37, 194], [110, 194], [182, 194], [74, 58], [146, 58], [219, 58]]
+cell_tol: 30.0
+max_edits: null   # null -> emit EVERY error in one critique; 1 restores the old one-edit-per-step form

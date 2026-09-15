@@ -15,6 +15,10 @@ class VLLMQwenVerifier(OpenAIChatVerifier):
         workers=8,
         enable_thinking=False,
         image_size=None,
+        use_enumeration=False,
+        top_p=None,
+        top_k=None,
+        presence_penalty=None,
     ):
         super().__init__(
             api_key=api_key,
@@ -28,4 +32,8 @@ class VLLMQwenVerifier(OpenAIChatVerifier):
             enable_thinking=enable_thinking,
             image_size=image_size,
             extra_payload={"chat_template_kwargs": {"enable_thinking": bool(enable_thinking)}},
+            use_enumeration=use_enumeration,
+            top_p=top_p,
+            top_k=top_k,
+            presence_penalty=presence_penalty,
         )

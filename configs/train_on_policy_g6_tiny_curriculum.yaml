@@ -1,0 +1,143 @@
+# On-policy feedback training on clevr_g6, starting from the 100-image model's step-250 checkpoint.
+#
+# The loss is NOT RL: rollout_loss is ordinary flow matching regressing to the ground-truth image,
+# conditioned on [caption, attempt_1, feedback_1, ...]. The verifier never enters the objective; it
+# only writes the language context. So this is conditional behaviour cloning on self-generated
+# errors, and the claim it can support is about SEQUENTIAL pass@k (accuracy after k feedback-guided
+# repairs), not about iid best-of-N.
+#
+# DATA BUDGET: exactly the same 100 images the base model was trained on (clevr_g6_tiny, split
+# train). Zero new supervision -- that is what makes a gain attributable to the feedback loop.
+# The 2,000 held-out captions are used for measurement only.
+defaults:
+  - dataset: clevr_g6_tiny
+  - verifier: clevr_detector_g6
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+# `ckpt` stays null: the base model is a FULL-FT .pt with no lora_ keys, so loading it through `ckpt`
+# under lora_finetune=true would match nothing and silently leave raw OmniGen-v1 underneath. It goes
+# in via model.base_ckpt, which strict-loads it as the frozen LoRA base.
+ckpt: null
+start_step: 0
+results_dir: /gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy   # NOT /gscratch/socialrl (97% full)
+experiment_name: on_policy_g6_tiny_curriculum
+
+dataset:
+  image_size: 256
+
+model:
+  _target_: models.omni_gen.OmniGenModel
+  model_name_or_path: Shitao/OmniGen-v1
+  base_ckpt: /gscratch/socialrl/sriyash/OmniGen-clevr-g6-tiny2k/clevr_g6_tiny2k/checkpoints/0000250.pt
+  image_height: 256
+  image_width: 256
+  vae: null
+  lora_finetune: true           # fresh adapter on a frozen D@250 base
+  # The control trained 201M params on 100 images (~2M per image) and memorised them: 83% exact on
+  # its own training captions by outer 78. Memorising needs capacity; a structured edit operator
+  # (7 colours x 3 shapes x 6 cells, 5 operations) does not.
+  lora_rank: 32                 # 201M -> 18.9M trainable params, a 10.7x cut
+  lora_alpha: 32                # keep scaling alpha/r = 1.0; leaving 128 here would 4x the updates
+  lora_dropout: 0.05
+  lora_init: gaussian
+  # Attention only. MLP is 62.5% of the LoRA params and is where recalled content tends to sit;
+  # attention does the routing an edit operator needs (find the cell the critique names, attend to
+  # that region of the source). Dropping MLP is a bigger cut than r=16-on-everything while keeping
+  # more rank per module.
+  lora_target_modules: [qkv_proj, o_proj]
+  gradient_checkpointing: true   # rollout_loss OOM'd on a 48GB L40S: a record carries up to 3
+                                # prior attempt images (768 image tokens) + 4 caption repeats.
+                                # Non-reentrant checkpointing is DDP-safe here (see omni_gen.py)
+                                # and keeps batch/LR/epochs unchanged; generation dominates
+                                # wall-clock (230s rollout vs ~50 update steps), so the cost is small.
+  mixed_precision: bf16
+  condition_dropout_prob: 0.0
+  max_input_length_limit: 18000
+  use_feedback_images: true     # no-op for on-policy (rollout_loss always passes prior attempts);
+                                # set true so the offline path would agree if it were ever used
+  keep_raw_resolution: false
+  stored_noise_prob: 1.0        # train on the rollout's stored x_T, so training noise == sampling noise
+
+trainer:
+  _target_: algorithms.on_policy.OnPolicyTrainer
+  verifier: ${verifier}
+  resume: null                  # job script fills this with the newest checkpoint on requeue
+  val_dataset:
+    _target_: datasets.build_clevr_dataset
+    datasets: ${dataset.datasets}
+    split: test                 # the held-out 2,000 -- measured, never trained on
+    image_size: ${dataset.image_size}
+    use_disk: true
+    load_meta: true
+    load_images: false
+    load_context: false
+  sampler:
+    type: ddim
+    num_sampling_steps: 25      # matches every other eval in this project
+    cfg_scale: 3.0
+    ddim_eta: 0.0
+  rollout:
+    samples: 200                # CHAINS per outer iteration: 50 unique captions x 4 chains
+    chains_per_prompt: 4        # 4 independent noise draws per caption -> 4 different attempts and
+                                # 4 different critiques all mapping to the SAME target. That is the
+                                # many-sources-per-target structure that forces the critique to
+                                # carry information instead of letting the caption shortcut to it.
+    length: 4                   # level-3 value; the curriculum overrides this per level
+                                # errors/scene and 100% of its scenes are repairable in <=3 edits.
+                                # Chains run the full 4 steps even after success, so the model also
+                                # learns to HOLD a correct image rather than drift off it.
+    use_ema: false
+    storage_dir: /gscratch/scrubbed/sriyash/rollouts/g6_tiny_curriculum
+    log_samples: 8
+    batch_size: 32              # GLOBAL -> 16/GPU
+  lr: 5e-5                      # fixed; this trainer has no LR schedule
+  weight_decay: 0.01            # penalises the large-norm solutions memorisation needs
+  global_batch_size: 32
+  global_seed: 0
+  updates_per_rollout: 25       # fallback only; the curriculum sets this per level
+  # Caption dropout on FEEDBACK rows only (position 0 has no source image). In clevr_g6 the caption
+  # alone determines the target, so attempt+critique are redundant inputs and the model can reach
+  # the target without ever reading them. Hiding the caption half the time leaves
+  # (source image + critique) as the only route. Present at inference -- a train-time regulariser.
+  caption_dropout_prob: 0.5
+  # Chain length grows; loss weight rises with position so the repaired attempt matters more than
+  # the first draft. Weights keep the ratios 1:3, 2:3:5, 2:3:5:10 but are scaled so the MEAN weight
+  # is 1.0 at every level -- otherwise later levels would silently train at a lower gradient scale
+  # and the curriculum would confound chain length with learning rate.
+  # updates = one epoch over that level's records (200 chains x length, batch 32).
+  curriculum:
+    - {loops: 25, length: 2, weights: [0.5, 1.5],            updates: 12}
+    - {loops: 25, length: 3, weights: [0.6, 0.9, 1.5],       updates: 19}
+    - {loops: 25, length: 4, weights: [0.4, 0.6, 1.0, 2.0],  updates: 25}
+  max_train_steps: 1400         # 25*12 + 25*19 + 25*25; the curriculum fixes the loop count
+  grad_clip: 1.0
+  ema_decay: 0.0
+  log_every: 50
+  ckpt_every: 200               # 7 milestones; 1400 is a multiple so the final one is written
+  eval_every: 100               # 14 points, resolving both level boundaries (steps 300 and 775).
+                                # The REPORTED model is the final checkpoint (1400), fixed in
+                                # advance, so there is no checkpoint cherry-picking
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    use_clevr_detector_scorer: true
+    detector_probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt
+    # Forwarded so the eval scorer scores placement exactly like the rollout verifier; without these
+    # eval/distance_step_* would stay position-blind.
+    detector_cell_centres: [[37, 194], [110, 194], [182, 194], [74, 58], [146, 58], [219, 58]]
+    detector_cell_tol: 30.0
+    caption_index: 42
+    batch_size: 32
+    seed: 0
+    steps: 4                    # logs eval/distance_step_0..3 -- the sequential curve
+wandb:
+  project: clevr_g6
+  auto_resume: true   # preemptable partition: re-attach to the same run on requeue (see train.py)

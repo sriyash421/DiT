@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import zarr
-from numcodecs import Blosc, VLenUTF8
+from numcodecs import Blosc
 from PIL import Image
 from torchvision import transforms
 
@@ -131,7 +131,10 @@ class ClevrZarrWriter:
             shutil.rmtree(self.output)
 
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-        root = zarr.open(str(self.output), mode="w")
+        # zarr_format=2: zarr-python 3.x defaults new stores to v3, whose codec pipeline rejects raw
+        # numcodecs objects (needs BytesBytesCodec). Force v2 so the numcodecs compressor/object_codec
+        # API below stays valid and the store matches the format of existing datasets on disk.
+        root = zarr.open(str(self.output), mode="w", zarr_format=2)
         data = root.require_group("data")
         meta = root.require_group("meta")
         root.attrs.update({
@@ -167,9 +170,9 @@ class ClevrZarrWriter:
             "metadata_index": meta.create_dataset("metadata_index", shape=(0,), chunks=chunks, dtype=np.int64, compressor=compressor, overwrite=True),
             "sample_index": meta.create_dataset("sample_index", shape=(0,), chunks=chunks, dtype=np.int64, compressor=compressor, overwrite=True),
             "feedback_index": meta.create_dataset("feedback_index", shape=(0,), chunks=chunks, dtype=np.int64, compressor=compressor, overwrite=True),
-            "caption": meta.create_dataset("caption", shape=(0,), chunks=chunks, dtype=object, object_codec=VLenUTF8(), compressor=compressor, overwrite=True),
-            "feedback": meta.create_dataset("feedback", shape=(0,), chunks=chunks, dtype=object, object_codec=VLenUTF8(), compressor=compressor, overwrite=True),
-            "tuple_id": meta.create_dataset("tuple_id", shape=(0,), chunks=chunks, dtype=object, object_codec=VLenUTF8(), compressor=compressor, overwrite=True),
+            "caption": meta.create_dataset("caption", shape=(0,), chunks=chunks, dtype=str, compressor=compressor, overwrite=True),
+            "feedback": meta.create_dataset("feedback", shape=(0,), chunks=chunks, dtype=str, compressor=compressor, overwrite=True),
+            "tuple_id": meta.create_dataset("tuple_id", shape=(0,), chunks=chunks, dtype=str, compressor=compressor, overwrite=True),
         }
 
     def _id_for(self, mapping, name):

@@ -85,7 +85,8 @@ class ClevrDetectorVerifier(FeedbackVerifier):
     workers = 1
 
     def __init__(self, device="cuda", probe_path=DEFAULT_PROBE, box_threshold=0.25, text_threshold=0.25,
-                 nms_iou=0.5, owlv2_threshold=0.15, blur_thresh=50.0, use_probe=True, use_owl=False):
+                 nms_iou=0.5, owlv2_threshold=0.15, blur_thresh=50.0, use_probe=True, use_owl=False,
+                 cell_centres=None, cell_tol=30.0, max_edits=None):
         self.device = device
         self.probe_path = probe_path
         self.box_threshold = float(box_threshold)
@@ -95,6 +96,12 @@ class ClevrDetectorVerifier(FeedbackVerifier):
         self.blur_thresh = float(blur_thresh)
         self.use_probe = bool(use_probe)   # False -> zero-shot CLIP shape (no probe file needed)
         self.use_owl = bool(use_owl)       # False -> skip OWLv2 count cap (avoids the scipy dep)
+        # Datasets whose captions name grid cells (clevr_g6) pass the cell pixel centres here; each
+        # detection is then tagged with the nearest cell so placement can be scored and repaired.
+        # Left as None the verifier stays position-blind, exactly as before.
+        self.cell_centres = [tuple(c) for c in cell_centres] if cell_centres else None
+        self.cell_tol = float(cell_tol)
+        self.max_edits = max_edits
         self._ready = False
 
     # ----------------------------------------------------------------- model loading
@@ -201,9 +208,22 @@ class ClevrDetectorVerifier(FeedbackVerifier):
         seen = []
         for box, shape in zip(boxes, shapes):
             sharp = _sharpness(gray_np, box)
-            seen.append({"color": _hsv_color(img_np, hsv_np, box), "shape": shape,
-                         "blurry": sharp < self.blur_thresh, "sharpness": round(sharp, 1)})
+            record = {"color": _hsv_color(img_np, hsv_np, box), "shape": shape,
+                      "blurry": sharp < self.blur_thresh, "sharpness": round(sharp, 1)}
+            if self.cell_centres is not None:
+                record["cell"] = self._cell_of(box)
+            seen.append(record)
         return seen
+
+    def _cell_of(self, box):
+        """Nearest grid cell to the box centre, or None if it is not close to any."""
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        best, best_d2 = None, self.cell_tol ** 2
+        for idx, (px, py) in enumerate(self.cell_centres):
+            d2 = (cx - px) ** 2 + (cy - py) ** 2
+            if d2 <= best_d2:
+                best, best_d2 = idx, d2
+        return best
 
     # ----------------------------------------------------------------- FeedbackVerifier hooks
     def _score_row(self, caption, attempt_image):
@@ -214,7 +234,7 @@ class ClevrDetectorVerifier(FeedbackVerifier):
         breakdown = enumeration_breakdown(caption, seen)
         if breakdown is None:
             return VerificationResult(ok=False, error="no objects parsed from caption")
-        command, _rule, _score = enumeration_feedback(caption, seen)
+        command, _rule, _score = enumeration_feedback(caption, seen, max_edits=self.max_edits)
         return VerificationResult(ok=True, feedback=command, score=breakdown["score"], breakdown=breakdown)
 
     def _distance_row(self, caption, gt_image, attempt_image):
