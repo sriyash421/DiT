@@ -612,12 +612,23 @@ class OnPolicyTrainer:
                 repair = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) > 0])
                 draft = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) == 0])
                 gt_rows = batch if self.anchor_draft_gt else repair
-                l_rep = (self.model.rollout_loss(
+                # EVERY RANK MUST RUN THE SAME NUMBER OF FORWARDS. DDP broadcasts module buffers
+                # once per forward, so a rank whose local batch happens to hold only drafts (or
+                # only repairs) would skip a collective and desynchronise the process group --
+                # NCCL then times out with rank 0 in an ALLREDUCE while its peers sit in a
+                # BROADCAST. At 4 ranks the local batch is 8 rows from a 50/50 buffer, so a
+                # single-class batch arrives roughly every 32 optimizer steps: frequent enough to
+                # kill every run. Both terms are therefore always evaluated, and whichever has no
+                # real rows is scaled to zero instead of being skipped.
+                rep_scale, anc_scale = 1.0, 1.0
+                if gt_rows is None:
+                    gt_rows, rep_scale = _select_rows(batch, [0]), 0.0
+                if draft is None:
+                    draft, anc_scale = _select_rows(batch, [0]), 0.0
+                l_rep = rep_scale * self.model.rollout_loss(
                     gt_rows, weights=weights if self.anchor_draft_gt else None,
                     caption_dropout_prob=self.caption_dropout_prob)
-                    if gt_rows is not None else torch.zeros((), device=self.device))
-                l_anc = (self.model.anchor_loss(draft)
-                         if draft is not None else torch.zeros((), device=self.device))
+                l_anc = anc_scale * self.model.anchor_loss(draft)
                 loss = l_rep + self.anchor_beta * l_anc
                 running["loss_repair"] += float(l_rep.item())
                 running["loss_anchor"] += float(l_anc.item())
