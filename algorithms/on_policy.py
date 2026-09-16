@@ -354,6 +354,9 @@ class OnPolicyTrainer:
         # supply of errors the repair step learns from stays stationary instead of drying up as
         # the draft improves -- which is what stalled the unanchored run at 83% draft accuracy.
         self.anchor_beta = float(anchor["beta"]) if anchor else 0.0
+        # When true the draft ALSO gets ground truth and the anchor is only a brake; when false
+        # the draft is held at the frozen base with no ground truth at all.
+        self.anchor_draft_gt = bool(anchor.get("draft_gt", False)) if anchor else False
         # The final attempt normally goes ungraded (nothing consumes its critique). The anchored
         # run needs its exact-rate as the headline diagnostic, so grade it too.
         self.verify_last = bool(getattr(rollout, "verify_last", False))
@@ -595,14 +598,24 @@ class OnPolicyTrainer:
                 weights = [pos_weights[min(int(p), len(pos_weights) - 1)]
                            for p in batch["chain_pos"]]
             if self.anchor_beta > 0.0:
-                # Draft rows (no critique yet) get NO ground truth -- they are pulled toward the
-                # frozen base. Repair rows get the usual flow-matching target. Splitting the batch
-                # is what lets one batch carry two different objectives.
+                # Draft rows (no critique yet) are pulled toward the frozen base; repair rows get
+                # the usual flow-matching target. Splitting the batch is what lets one batch carry
+                # two different objectives.
+                #
+                # anchor.draft_gt selects between the two arms:
+                #   false -- the draft gets NO ground truth, so it is fully pinned to the base.
+                #   true  -- the draft ALSO regresses to ground truth ("expert loss at step 0"),
+                #            and the anchor is only a brake. Both terms are quadratic in the
+                #            predicted velocity, so the draft settles at a blend,
+                #            (w*v_gt + beta*v_base)/(w+beta): beta is the fraction pulled back
+                #            toward the base, not an on/off switch.
                 repair = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) > 0])
                 draft = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) == 0])
+                gt_rows = batch if self.anchor_draft_gt else repair
                 l_rep = (self.model.rollout_loss(
-                    repair, caption_dropout_prob=self.caption_dropout_prob)
-                    if repair is not None else torch.zeros((), device=self.device))
+                    gt_rows, weights=weights if self.anchor_draft_gt else None,
+                    caption_dropout_prob=self.caption_dropout_prob)
+                    if gt_rows is not None else torch.zeros((), device=self.device))
                 l_anc = (self.model.anchor_loss(draft)
                          if draft is not None else torch.zeros((), device=self.device))
                 loss = l_rep + self.anchor_beta * l_anc

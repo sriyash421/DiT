@@ -24,7 +24,7 @@ hydra:
 ckpt: null
 start_step: 0
 results_dir: /gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy   # NOT /gscratch/socialrl (97% full)
-experiment_name: on_policy_g6_anchor
+experiment_name: on_policy_g6_anchor_b02
 
 dataset:
   image_size: 256
@@ -97,8 +97,8 @@ trainer:
   # The reference is the adapter switched off -- no second model in memory -- and because LoRA
   # inits B=0 this loss is exactly 0 at initialisation: beta is a restoring force, not a tax.
   anchor:
-    draft_gt: false           # arm A: the draft gets NO ground truth, only the anchor
-    beta: 1.0
+    draft_gt: true            # arm B: the draft ALSO regresses to ground truth ("expert loss")
+    beta: 0.2
   # Repair rows only (a draft has no critique). The caption alone determines the target, so without
   # this the model can memorise caption->GT at the repair step and ignore the critique entirely.
   caption_dropout_prob: 0.25
