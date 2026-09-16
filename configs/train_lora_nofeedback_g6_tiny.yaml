@@ -1,0 +1,93 @@
+# NO-FEEDBACK LoRA CONTROL for the on-policy feedback experiment.
+#
+# The question this answers: is the in-context model better because of the FEEDBACK, or because of
+# how it was trained -- a LoRA adapter on a frozen base, which at 100 images is a far stronger
+# regulariser than the baselines' full fine-tuning?
+#
+# The offline checkpoint ladder already rules out the generic "you just trained longer" objection:
+# full FT on these same 100 images from 2,500 to 15,000 steps never approaches the in-context model
+# (best-of-k at k=1: 0.240 vs 0.338) and is flat at k=8. What it cannot rule out is the ARCHITECTURE
+# of the on-policy run. This config isolates exactly that.
+#
+# Held identical to configs/train_on_policy_g6_tiny.yaml:
+#   base checkpoint (D@250), the same 100 images, LoRA r128/alpha128/gaussian on the same four
+#   projection families, batch 32, lr 5e-5 fixed, weight_decay 0.0, grad_clip 1.0, ema_decay 0.0,
+#   bf16, gradient checkpointing, 5,000 optimiser steps.
+#
+# The ONE difference: no rollouts, no verifier, no feedback in the context. Plain flow matching on
+# (caption -> ground-truth image). That makes this ~1,600 epochs over 100 images; that is what
+# "matched on optimiser steps" costs here, and it should be stated rather than hidden.
+defaults:
+  - dataset: clevr_g6_tiny
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+# Same reasoning as the on-policy config: the base is a FULL-FT .pt with no lora_ keys, so it goes
+# in through model.base_ckpt (strict-loaded as the frozen LoRA base), not through `ckpt`.
+ckpt: null
+start_step: 0
+results_dir: /gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy
+experiment_name: lora_nofeedback_g6_tiny_d250
+
+dataset:
+  image_size: 256
+
+model:
+  _target_: models.omni_gen.OmniGenModel
+  model_name_or_path: Shitao/OmniGen-v1
+  base_ckpt: /gscratch/socialrl/sriyash/OmniGen-clevr-g6-tiny2k/clevr_g6_tiny2k/checkpoints/0000250.pt
+  image_height: 256
+  image_width: 256
+  vae: null
+  lora_finetune: true
+  lora_rank: 128
+  lora_alpha: 128
+  lora_init: gaussian
+  lora_target_modules: [qkv_proj, o_proj, gate_up_proj, down_proj]
+  gradient_checkpointing: true
+  mixed_precision: bf16
+  condition_dropout_prob: 0.0
+  max_input_length_limit: 18000
+  use_feedback_images: false    # THE ablation: no prior attempt ever enters the context
+  keep_raw_resolution: false
+
+trainer:
+  _target_: algorithms.offline.OfflineTrainer
+  epochs: 100000                # step-bounded, not epoch-bounded; max_train_steps is the real limit
+  max_train_steps: 5000         # matched to the in-context run's optimiser steps
+  global_batch_size: 32
+  global_seed: 0
+  lr: 5e-5
+  lr_schedule: none             # the on-policy trainer has no schedule; match it rather than the
+  lr_warmup_steps: 0            # offline baselines, so the only moving part stays the feedback
+  min_lr: 5e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema_decay: 0.0
+  log_every: 50
+  ckpt_every: 250               # preemptable partition: checkpoint often, and give the eval the
+                                # same 250-step grid the other arms have
+  dataloader:
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    split: test                 # the held-out 2,000 -- measured, never trained on
+    batch_size: 32
+    max_batches_per_dataset: 16
+    dataloader:
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: false
+      prefetch_factor: 2
+
+wandb:
+  project: clevr_g6
+  entity: sriyash-uw-team
+  name: ${experiment_name}
+  mode: online
