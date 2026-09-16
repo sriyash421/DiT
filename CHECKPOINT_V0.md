@@ -7,6 +7,15 @@ git; this file records where they live and how to rebuild them.
 **Report:** https://wandb.ai/sriyash-uw-team/clevr_g6/reports/clevr_g6-—-data-scale,-memorisation,-and-on-policy-feedback--VmlldzoxNzk0MTIyMw==
 **wandb:** entity `sriyash-uw-team`, project `clevr_g6`, figures logged to run `m2hasqdr`.
 
+**Artifacts** — the images and checkpoints, mirrored privately on HuggingFace so the experiment can
+be picked up without cluster access:
+
+| | |
+|---|---|
+| images (100 train + 200 held-out, in eval order) | https://huggingface.co/datasets/sriyash421/clevr-g6-tiny-v0 |
+| checkpoints (base @250, offline @2500, in-context LoRA @5000) | https://huggingface.co/sriyash421/onpolicy-distill-v0 |
+| local bundle | `/gscratch/socialrl/sriyash/onpolicy_distill_v0_artifacts` |
+
 ---
 
 ## 1. What v0 is, and one honesty note about its provenance
@@ -29,10 +38,23 @@ commit that was checked out when the control ran.
 
 ## 2. Environment
 
-| | |
-|---|---|
-| training / evaluation | `/mmfs1/gscratch/socialrl/sriyash/DiT/.venv-omni/bin/python` |
-| plotting | `/mmfs1/gscratch/socialrl/sriyash/DiT/.venv-unidet/bin/python` — the only env with `seaborn`, which the house plot style needs |
+| task | interpreter | why this one |
+|---|---|---|
+| **data generation** | `.venv/bin/python` | zarr **2.18.7**. `.venv-omni` ships zarr **3.1.6**, which cannot WRITE the v2 schema the builders produce — using it here fails |
+| training / evaluation | `.venv-omni/bin/python` | torch 2.4.1, peft 0.9.0, OmniGen. **This is the stack every reported number was produced on** |
+| plotting | `.venv-unidet/bin/python` | the only env with `seaborn`, which the house plot style needs |
+
+All three are under `/mmfs1/gscratch/socialrl/sriyash/DiT/`, built by uv 0.9.18 on CPython 3.11.11.
+Exact contents are frozen in `repro/environments/{venv,venv-omni,venv-unidet}.txt`.
+
+Two things worth knowing before trusting `pyproject.toml`/`uv.lock`:
+
+- **They describe none of the envs that produced results.** They pin torch 2.12.0; everything here
+  ran on torch 2.4.1. Treat `repro/environments/*.txt` as the reproduction record, not the lockfile.
+- **`.venv-unidet` is a superset of `.venv-omni`** — every package at identical versions, differing
+  only in zarr/numcodecs, where it has the data-capable zarr 2.18.7. So it is a candidate single
+  environment for all three roles. Not verified for a training step or a generation pass, so it was
+  not used that way for anything reported here.
 | `wandb_workspaces` | not in any venv; vendored at `.../jobs/<id>/tmp/pylibs`, installed with `pip install --target`. Report builds need it on `PYTHONPATH` |
 | env vars | `HF_HOME=/gscratch/scrubbed/sriyash/hf`, `HF_HUB_OFFLINE=1`, `TOKENIZERS_PARALLELISM=false` |
 
