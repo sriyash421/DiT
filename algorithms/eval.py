@@ -184,6 +184,8 @@ def adaptive_eval(model, verifier, captions, gt_images, steps, seed, scorer, sam
     attempt_path_history = [[] for _ in range(count)]
     traces = [[] for _ in range(count)]
     active = list(range(count))
+    # One x_T per chain, kept for the whole chain: only the critique changes between attempts.
+    episode_noise = {}
     token_count = 0
     tmp_dir = Path(tempfile.mkdtemp(prefix="adaptive_eval_"))
 
@@ -196,13 +198,25 @@ def adaptive_eval(model, verifier, captions, gt_images, steps, seed, scorer, sam
             "attempt_images": [list(attempt_image_history[idx]) for idx in active],
             "attempt_paths": [list(attempt_path_history[idx]) for idx in active],
         }
-        attempt_images = model.generate(
+        # Bind x_T per chain, exactly as RolloutCollector does in training and as the reported
+        # pass@k eval does. With fresh noise at every step the chain is a sequence of independent
+        # draws that happen to carry context, which both measures the model off the distribution it
+        # was trained on and invites the "this is just best-of-N" reading. Rows drop out of `active`
+        # as they finish, so the noise is keyed by batch index rather than by position.
+        init_latents = None
+        if all(idx in episode_noise for idx in active):
+            init_latents = torch.stack([episode_noise[idx] for idx in active])
+        attempt_images, attempt_latents = model.generate(
             context_batch,
             num_sampling_steps=int(sampler_cfg.num_sampling_steps),
             cfg_scale=float(sampler_cfg.cfg_scale),
             ddim_eta=float(sampler_cfg.ddim_eta),
             seed=seed + step,
+            return_latents=True,
+            init_latents=init_latents,
         )
+        for pos, batch_idx in enumerate(active):
+            episode_noise.setdefault(batch_idx, attempt_latents[pos].detach())
         active_captions = [captions[idx] for idx in active]
         active_gt_images = [gt_images[idx] for idx in active]
         attempt_paths = []

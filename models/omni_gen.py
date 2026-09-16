@@ -492,7 +492,17 @@ class OmniGenModel:
             )
         features = []
         dropped = 0
-        own_attempts = batch.get("own_attempt") or batch["gt_image"]
+        # No silent fallback to ground truth here. The anchor term distils the draft toward the
+        # frozen base's velocity on the model's OWN attempt; if that attempt were quietly replaced
+        # by the ground-truth image, the draft would be regressing to GT and the whole pinned-draft
+        # arm would be measuring nothing. Fail loudly instead.
+        own_attempts = batch.get("own_attempt")
+        if target != "gt" and not own_attempts:
+            raise ValueError(
+                "anchor target requested but the batch carries no 'own_attempt'; refusing to fall "
+                "back to 'gt_image', which would leak ground truth into the anchored draft")
+        if own_attempts is None:
+            own_attempts = batch["gt_image"]
         for gt_image, own_attempt, caption, feedback_history, attempt_images in zip(
             batch["gt_image"], own_attempts, batch["caption"], batch["feedback_history"],
             batch["attempt_images"]
