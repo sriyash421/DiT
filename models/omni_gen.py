@@ -382,6 +382,80 @@ class OmniGenModel:
         w = torch.as_tensor(weights, device=per_sample.device, dtype=per_sample.dtype)
         return (per_sample * w).sum() / w.sum().clamp_min(1e-8)
 
+    def anchor_loss(self, batch):
+        """Hold the DRAFT step at the frozen base instead of supervising it to ground truth.
+
+        Distils in VELOCITY space: the adapted model and the reference are evaluated at the same
+        (x_t, t) and the loss is the squared difference of their predicted velocities. No sampling
+        is needed, so this costs one extra forward, on draft rows only.
+
+        The reference is the base with the LoRA adapter switched off (peft's disable_adapter()), so
+        there is no second set of weights in memory. Because LoRA inits B=0 the adapter IS the
+        identity at step 0, hence this loss is exactly 0 at initialisation: beta is a restoring
+        force against drift, not a standing cost.
+
+        x1 is the model's own latest attempt, never the ground truth, so no GT signal reaches the
+        draft step. The reference forward goes through the UNWRAPPED module -- routing it through
+        DDP would register a second forward that DDP then expects to join the backward.
+        """
+        from OmniGen.utils import vae_encode, vae_encode_list
+
+        from algorithms.utils import unwrap_model
+
+        collated = self._rollout_collate(batch, caption_dropout_prob=0.0, target="attempt")
+        images = move_to_device(collated["output_images"], self.device)
+        input_pixel_values = move_to_device(collated["input_pixel_values"], self.device)
+        with torch.no_grad():
+            if isinstance(images, list):
+                x1 = vae_encode_list(self.vae, images, self.weight_dtype)
+                input_latents = (vae_encode_list(self.vae, input_pixel_values, self.weight_dtype)
+                                 if input_pixel_values is not None else None)
+            else:
+                x1 = vae_encode(self.vae, images, self.weight_dtype)
+                input_latents = (vae_encode(self.vae, input_pixel_values, self.weight_dtype)
+                                 if input_pixel_values is not None else None)
+
+        model_kwargs = move_to_device({
+            "input_ids": collated["input_ids"],
+            "input_img_latents": input_latents,
+            "input_image_sizes": collated["input_image_sizes"],
+            "attention_mask": collated["attention_mask"],
+            "position_ids": collated["position_ids"],
+            "padding_latent": collated["padding_images"],
+            "past_key_values": None,
+            "return_past_key_values": False,
+        }, self.device)
+
+        # one shared noise draw and timestep, so both models are compared at the same point
+        stored = collated.get("init_latents")
+        if isinstance(x1, (list, tuple)):
+            x0 = ([n.to(device=self.device, dtype=l.dtype) if n is not None else torch.randn_like(l)
+                   for n, l in zip(stored, x1)] if stored is not None
+                  else [torch.randn_like(l) for l in x1])
+            B = len(x1)
+            u = torch.normal(mean=0.0, std=1.0, size=(B,))
+            t = (1 / (1 + torch.exp(-u))).to(x1[0])
+            xt = [t[i] * x1[i] + (1 - t[i]) * x0[i] for i in range(B)]
+        else:
+            x0 = (torch.stack([n if n is not None else torch.randn(x1.shape[1:]) for n in stored]
+                              ).to(device=self.device, dtype=x1.dtype)
+                  if stored is not None else torch.randn_like(x1))
+            B = x1.shape[0]
+            u = torch.normal(mean=0.0, std=1.0, size=(B,))
+            t = (1 / (1 + torch.exp(-u))).to(x1)
+            t_ = t.view(t.size(0), *([1] * (len(x1.size()) - 1)))
+            xt = t_ * x1 + (1 - t_) * x0
+
+        module = unwrap_model(self.net)
+        with torch.no_grad():
+            with module.disable_adapter():
+                v_ref = module(xt, t, **model_kwargs)
+        v_theta = self.net(xt, t, **model_kwargs)
+        if isinstance(v_theta, (list, tuple)):
+            return torch.stack([((a - b.detach()) ** 2).mean()
+                                for a, b in zip(v_theta, v_ref)]).mean()
+        return ((v_theta - v_ref.detach()) ** 2).mean()
+
     def rollout_loss(self, batch, weights=None, caption_dropout_prob=0.0):
         """Turn rollout rows (full history) into OmniGen edit examples and run the flow loss.
 
@@ -397,6 +471,17 @@ class OmniGenModel:
         dropped: they have no source image, so blanking the caption would leave nothing to condition
         on. The caption is always present at inference -- this is a train-time regulariser.
         """
+        collated = self._rollout_collate(batch, caption_dropout_prob=caption_dropout_prob,
+                                         target="gt")
+        return self.loss(collated, weights=weights)
+
+    def _rollout_collate(self, batch, caption_dropout_prob=0.0, target="gt"):
+        """Shared feature building for rollout_loss and anchor_loss.
+
+        `target` chooses what the flow regresses toward: "gt" is the ground-truth image (the repair
+        objective); "attempt" is the model's own latest attempt, which anchor_loss uses so that
+        ground truth never reaches the draft step.
+        """
         if self._rollout_collator is None:
             from algorithms.utils import unwrap_model
 
@@ -407,8 +492,10 @@ class OmniGenModel:
             )
         features = []
         dropped = 0
-        for gt_image, caption, feedback_history, attempt_images in zip(
-            batch["gt_image"], batch["caption"], batch["feedback_history"], batch["attempt_images"]
+        own_attempts = batch.get("own_attempt") or batch["gt_image"]
+        for gt_image, own_attempt, caption, feedback_history, attempt_images in zip(
+            batch["gt_image"], own_attempts, batch["caption"], batch["feedback_history"],
+            batch["attempt_images"]
         ):
             if feedback_history and caption_dropout_prob > 0.0 and random.random() < caption_dropout_prob:
                 caption = MASKED_CAPTION
@@ -416,9 +503,10 @@ class OmniGenModel:
             instruction = history_instruction(caption, feedback_history)
             input_images = [self.transform(image) for image in attempt_images] or None
             mllm_input = self.processor.process_multi_modal_prompt(instruction, input_images)
+            out_img = gt_image if target == "gt" else own_attempt
             features.append({
                 "mllm_input": mllm_input,
-                "output_image": self.transform(gt_image),
+                "output_image": self.transform(out_img),
                 "source_index": 0,
                 "is_feedback": bool(feedback_history),
             })
@@ -427,7 +515,7 @@ class OmniGenModel:
         if batch.get("init_latents") is not None:
             collated["init_latents"] = batch["init_latents"]
         self.last_caption_dropped = dropped
-        return self.loss(collated, weights=weights)
+        return collated
 
     @torch.no_grad()
     def generate(self, batch, num_sampling_steps, cfg_scale=1.0, ddim_eta=0.0, seed=None,

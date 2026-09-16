@@ -1,0 +1,129 @@
+# On-policy feedback training on clevr_g6, starting from the 100-image model's step-250 checkpoint.
+#
+# The loss is NOT RL: rollout_loss is ordinary flow matching regressing to the ground-truth image,
+# conditioned on [caption, attempt_1, feedback_1, ...]. The verifier never enters the objective; it
+# only writes the language context. So this is conditional behaviour cloning on self-generated
+# errors, and the claim it can support is about SEQUENTIAL pass@k (accuracy after k feedback-guided
+# repairs), not about iid best-of-N.
+#
+# DATA BUDGET: exactly the same 100 images the base model was trained on (clevr_g6_tiny, split
+# train). Zero new supervision -- that is what makes a gain attributable to the feedback loop.
+# The 2,000 held-out captions are used for measurement only.
+defaults:
+  - dataset: clevr_g6_tiny
+  - verifier: clevr_detector_g6
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+# `ckpt` stays null: the base model is a FULL-FT .pt with no lora_ keys, so loading it through `ckpt`
+# under lora_finetune=true would match nothing and silently leave raw OmniGen-v1 underneath. It goes
+# in via model.base_ckpt, which strict-loads it as the frozen LoRA base.
+ckpt: null
+start_step: 0
+results_dir: /gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy   # NOT /gscratch/socialrl (97% full)
+experiment_name: on_policy_g6_anchor
+
+dataset:
+  image_size: 256
+
+model:
+  _target_: models.omni_gen.OmniGenModel
+  model_name_or_path: Shitao/OmniGen-v1
+  base_ckpt: /gscratch/socialrl/sriyash/OmniGen-clevr-g6-tiny2k/clevr_g6_tiny2k/checkpoints/0000250.pt
+  image_height: 256
+  image_width: 256
+  vae: null
+  lora_finetune: true           # fresh adapter on a frozen D@250 base; also keeps checkpoints ~1GB
+  lora_rank: 128
+  lora_alpha: 128
+  lora_init: gaussian
+  lora_target_modules: [qkv_proj, o_proj, gate_up_proj, down_proj]
+  gradient_checkpointing: true   # rollout_loss OOM'd on a 48GB L40S: a record carries up to 3
+                                # prior attempt images (768 image tokens) + 4 caption repeats.
+                                # Non-reentrant checkpointing is DDP-safe here (see omni_gen.py)
+                                # and keeps batch/LR/epochs unchanged; generation dominates
+                                # wall-clock (230s rollout vs ~50 update steps), so the cost is small.
+  mixed_precision: bf16
+  condition_dropout_prob: 0.0
+  max_input_length_limit: 18000
+  use_feedback_images: true     # no-op for on-policy (rollout_loss always passes prior attempts);
+                                # set true so the offline path would agree if it were ever used
+  keep_raw_resolution: false
+  stored_noise_prob: 1.0        # train on the rollout's stored x_T, so training noise == sampling noise
+
+trainer:
+  _target_: algorithms.on_policy.OnPolicyTrainer
+  verifier: ${verifier}
+  resume: null                  # job script fills this with the newest checkpoint on requeue
+  val_dataset:
+    _target_: datasets.build_clevr_dataset
+    datasets: ${dataset.datasets}
+    split: test                 # the held-out 2,000 -- measured, never trained on
+    image_size: ${dataset.image_size}
+    use_disk: true
+    load_meta: true
+    load_images: false
+    load_context: false
+  sampler:
+    type: ddim
+    num_sampling_steps: 25      # matches every other eval in this project
+    cfg_scale: 3.0
+    ddim_eta: 0.0
+  rollout:
+    samples: 400                # CHAINS per outer iteration: 100 captions x 4 drafts
+    chains_per_prompt: 4        # many drafts per caption -> many distinct (draft, critique) pairs
+                                # for the same target, which is what forces the critique to matter
+    verify_last: true           # grade the repair too, so rollout/repair_exact exists. Costs one
+                                # extra verifier call per chain and is the headline diagnostic.
+    length: 2                   # draft + ONE repair. The draft is not trained toward GT at all
+                                # errors/scene and 100% of its scenes are repairable in <=3 edits.
+                                # Chains run the full 4 steps even after success, so the model also
+                                # learns to HOLD a correct image rather than drift off it.
+    use_ema: false
+    storage_dir: /gscratch/scrubbed/sriyash/rollouts/g6_anchor
+    log_samples: 8
+    batch_size: 32              # GLOBAL -> 16/GPU
+  lr: 5e-5                      # fixed; this trainer has no LR schedule
+  weight_decay: 0.0
+  global_batch_size: 32
+  global_seed: 0
+  updates_per_rollout: 25       # one epoch over the 800 records/iter (400 chains x 2)
+  # Draft rows are held at the FROZEN BASE instead of being supervised to ground truth, so the
+  # supply of errors the repair step learns from stays stationary. Without this the draft climbs
+  # (83% exact on train by outer 78 in the unanchored run) and the repair signal dries up.
+  # The reference is the adapter switched off -- no second model in memory -- and because LoRA
+  # inits B=0 this loss is exactly 0 at initialisation: beta is a restoring force, not a tax.
+  anchor:
+    beta: 1.0
+  # Repair rows only (a draft has no critique). The caption alone determines the target, so without
+  # this the model can memorise caption->GT at the repair step and ignore the critique entirely.
+  caption_dropout_prob: 0.25
+  max_train_steps: 2500         # 100 outer iterations x 25 updates
+  grad_clip: 1.0
+  ema_decay: 0.0
+  log_every: 50
+  ckpt_every: 250               # 10 milestones; 2500 is a multiple so the final one is written
+  eval_every: 125               # 20 points: the draft/repair divergence should be readable early
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    drop_last: true
+  eval:
+    use_clevr_detector_scorer: true
+    detector_probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt
+    # Forwarded so the eval scorer scores placement exactly like the rollout verifier; without these
+    # eval/distance_step_* would stay position-blind.
+    detector_cell_centres: [[37, 194], [110, 194], [182, 194], [74, 58], [146, 58], [219, 58]]
+    detector_cell_tol: 30.0
+    caption_index: 42
+    batch_size: 32
+    seed: 0
+    steps: 4                    # logs eval/distance_step_0..3 -- the sequential curve
+wandb:
+  project: clevr_g6
+  auto_resume: true   # preemptable partition: re-attach to the same run on requeue (see train.py)

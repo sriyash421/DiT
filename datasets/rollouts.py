@@ -43,6 +43,10 @@ class RolloutBuffer(Dataset):
         record = self.records[int(idx)]
         return {
             "gt_image": Image.open(record["gt_path"]).convert("RGB"),
+            # The image THIS row produced (distinct from attempt_images, which is the context of
+            # PRIOR attempts and is empty on a draft row). anchor_loss regresses toward this so
+            # that ground truth never reaches the draft step.
+            "own_attempt": Image.open(record["attempt_path"]).convert("RGB"),
             "caption": record["caption"],
             "feedback_history": list(record["feedback_history"]),
             "attempt_images": [Image.open(path).convert("RGB") for path in record["attempt_paths"]],
@@ -59,7 +63,8 @@ class RolloutBuffer(Dataset):
 
 def rollout_collate(batch):
     """Group rollout rows into per-field lists; the model's rollout_loss does tensor conversion."""
-    keys = ("gt_image", "caption", "feedback_history", "attempt_images", "attempt_paths")
+    keys = ("gt_image", "own_attempt", "caption", "feedback_history", "attempt_images",
+            "attempt_paths")
     out = {key: [item[key] for item in batch] for key in keys}
     latents = [item.get("init_latent") for item in batch]
     out["init_latents"] = latents if any(l is not None for l in latents) else None

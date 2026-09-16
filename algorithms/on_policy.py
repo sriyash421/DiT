@@ -52,11 +52,15 @@ class RolloutCollector:
     the GT path; the model turns that history into a loss at update time.
     """
 
-    def __init__(self, model, sampler_cfg, verifier, rollout_length=1):
+    def __init__(self, model, sampler_cfg, verifier, rollout_length=1, verify_last=False):
         self.model = model
         self.sampler_cfg = sampler_cfg
         self.verifier = verifier
         self.rollout_length = max(1, int(rollout_length))
+        # The final attempt is normally left ungraded because nothing consumes its critique.
+        # Grading it costs one extra verifier call per chain and yields the per-position exact
+        # rates, which are the headline diagnostic for anchored training.
+        self.verify_last = bool(verify_last)
 
     def _generate(self, captions, feedback_history, attempt_image_history,
                   attempt_path_history, seed, init_latents=None):
@@ -84,6 +88,7 @@ class RolloutCollector:
         attempts_dir.mkdir(parents=True, exist_ok=True)
         gt_dir.mkdir(parents=True, exist_ok=True)
         records = []
+        exact_by_pos = {}
         base_attempted = 0
         sampled_attempts = 0
         failed = 0
@@ -142,17 +147,25 @@ class RolloutCollector:
                 # The last attempt needs no feedback (nothing would consume it).
                 is_last = step_idx + 1 >= self.rollout_length
                 results = None
-                if not is_last:
+                if not is_last or self.verify_last:
                     results = self.verifier.verify(
                         captions, gt_images, attempt_images,
                         [list(history) for history in feedback_history],
                     )
                     token_count += sum(int(result.token_count) for result in results)
                     failed += sum(1 for result in results if not result.ok)   # verifier health only
+                    # per-position exact rate: position 0 is the draft, later positions the repairs.
+                    # Under anchoring these two must diverge -- draft flat, repair rising.
+                    for result in results:
+                        ok = (result.ok and
+                              str(result.feedback).strip().lower().rstrip(".") == "no update")
+                        exact_by_pos.setdefault(step_idx, []).append(1.0 if ok else 0.0)
 
                 for idx in range(batch_size):
-                    # a verifier error just yields empty feedback; the chain continues either way
-                    feedback = results[idx].feedback if results is not None and results[idx].ok else ""
+                    # a verifier error just yields empty feedback; the chain continues either way.
+                    # The final attempt's critique is discarded even when graded: nothing consumes it.
+                    feedback = ("" if is_last else
+                                (results[idx].feedback if results is not None and results[idx].ok else ""))
                     record_id = len(records)
                     attempt_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.png"
                     attempt_images[idx].save(attempt_path)
@@ -183,6 +196,10 @@ class RolloutCollector:
             "success": int(len(records)),
             "failed": int(failed),
             "gemini_tokens": int(token_count),
+            # raw counts, not rates: all_reduce_rollout_stats only carries the integer keys above,
+            # so the trainer reduces these itself and forms the rate after summing across ranks.
+            "exact_pos_sum": {k: float(sum(v)) for k, v in exact_by_pos.items()},
+            "exact_pos_n": {k: float(len(v)) for k, v in exact_by_pos.items()},
         }
         torch.save({"records": records, "stats": stats}, output_dir / "records.pt")
         return stats
@@ -192,6 +209,23 @@ def samples_for_rank(global_count, rank, world_size):
     base = int(global_count) // int(world_size)
     remainder = int(global_count) % int(world_size)
     return base + int(rank < remainder)
+
+
+def _select_rows(batch, idx):
+    """Sub-batch of a rollout_collate dict, or None when no row qualifies.
+
+    Anchored training runs two objectives over one batch, so the rows must be separable: repair
+    rows regress to ground truth, draft rows are distilled toward the frozen base.
+    """
+    if not idx:
+        return None
+    out = {}
+    for key, value in batch.items():
+        if isinstance(value, list) and len(value) == len(batch["caption"]):
+            out[key] = [value[i] for i in idx]
+        else:
+            out[key] = value
+    return out
 
 
 def all_reduce_rollout_stats(stats, device):
@@ -281,6 +315,7 @@ class OnPolicyTrainer:
         eval_every=None,
         curriculum=None,
         caption_dropout_prob=0.0,
+        anchor=None,
     ):
         from verifiers.eval_metrics import scorer_from_eval_cfg
 
@@ -314,6 +349,14 @@ class OnPolicyTrainer:
         # resuming mid-curriculum needs no extra state. None => the original fixed-length behaviour.
         self.curriculum = [dict(level) for level in curriculum] if curriculum else None
         self.caption_dropout_prob = float(caption_dropout_prob)
+        # Anchored training: draft rows (no critique in context) are NOT supervised to ground
+        # truth. They are held at the frozen base by a velocity-space distillation term, so the
+        # supply of errors the repair step learns from stays stationary instead of drying up as
+        # the draft improves -- which is what stalled the unanchored run at 83% draft accuracy.
+        self.anchor_beta = float(anchor["beta"]) if anchor else 0.0
+        # The final attempt normally goes ungraded (nothing consumes its critique). The anchored
+        # run needs its exact-rate as the headline diagnostic, so grade it too.
+        self.verify_last = bool(getattr(rollout, "verify_last", False))
         self.cumulative_verifier_tokens = 0
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -335,6 +378,7 @@ class OnPolicyTrainer:
             sampler_cfg=sampler,
             verifier=verifier,
             rollout_length=rollout.length,
+            verify_last=self.verify_last,
         )
 
         self.params = model.trainable_parameters()
@@ -464,6 +508,13 @@ class OnPolicyTrainer:
         rollout_seconds = time() - rollout_start
 
         global_stats = all_reduce_rollout_stats(stats, self.device)
+        # Per-position exact rates, summed across ranks before forming the rate. Under anchoring
+        # these are the whole diagnostic: the draft must stay FLAT while the repair RISES.
+        pos_rates = {}
+        for pos in sorted(stats.get("exact_pos_n", {})):
+            hits = all_reduce_scalar(stats["exact_pos_sum"][pos], self.device)
+            total = all_reduce_scalar(stats["exact_pos_n"][pos], self.device)
+            pos_rates[int(pos)] = hits / max(total, 1.0)
         max_rollout_seconds = all_reduce_scalar(rollout_seconds, self.device, op=dist.ReduceOp.MAX)
         self.cumulative_verifier_tokens += global_stats["gemini_tokens"]
         # Feedback-verifier cost is per-rank (sum); the eval scorer runs on rank 0 only.
@@ -481,6 +532,10 @@ class OnPolicyTrainer:
                 "verifier/total_tokens": self.cumulative_verifier_tokens,
                 "verifier/tokens_this_rollout": global_stats["gemini_tokens"],
                 "verifier/total_session_cost": verifier_cost + getattr(self.scorer, "session_cost", 0.0),
+                **({"rollout/draft_exact": pos_rates[0]} if 0 in pos_rates else {}),
+                **({"rollout/repair_exact": pos_rates[max(pos_rates)]}
+                   if pos_rates and max(pos_rates) > 0 else {}),
+                **{f"rollout/exact_pos_{p}": r for p, r in pos_rates.items()},
             }, step=self.train_steps)
         self.logger.info(
             f"Rollout outer={outer_step:06d}: generated {global_stats['attempted']} attempts "
@@ -525,7 +580,8 @@ class OnPolicyTrainer:
             drop_last=False,
             **({"prefetch_factor": 4, "persistent_workers": True} if self.num_workers > 0 else {}),
         )
-        running = {key: 0.0 for key in ("loss", "grad_norm", "mean_weight", "caption_dropped")}
+        running = {key: 0.0 for key in ("loss", "grad_norm", "mean_weight", "caption_dropped",
+                                        "loss_repair", "loss_anchor")}
         log_steps = 0
         log_start = time()
         self.model.net.train()
@@ -538,8 +594,23 @@ class OnPolicyTrainer:
                 # level were reused; clamp rather than crash.
                 weights = [pos_weights[min(int(p), len(pos_weights) - 1)]
                            for p in batch["chain_pos"]]
-            loss = self.model.rollout_loss(
-                batch, weights=weights, caption_dropout_prob=self.caption_dropout_prob)
+            if self.anchor_beta > 0.0:
+                # Draft rows (no critique yet) get NO ground truth -- they are pulled toward the
+                # frozen base. Repair rows get the usual flow-matching target. Splitting the batch
+                # is what lets one batch carry two different objectives.
+                repair = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) > 0])
+                draft = _select_rows(batch, [i for i, p in enumerate(batch["chain_pos"]) if int(p) == 0])
+                l_rep = (self.model.rollout_loss(
+                    repair, caption_dropout_prob=self.caption_dropout_prob)
+                    if repair is not None else torch.zeros((), device=self.device))
+                l_anc = (self.model.anchor_loss(draft)
+                         if draft is not None else torch.zeros((), device=self.device))
+                loss = l_rep + self.anchor_beta * l_anc
+                running["loss_repair"] += float(l_rep.item())
+                running["loss_anchor"] += float(l_anc.item())
+            else:
+                loss = self.model.rollout_loss(
+                    batch, weights=weights, caption_dropout_prob=self.caption_dropout_prob)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.params, self.grad_clip)
             grad_norm_avg = all_reduce_scalar(float(grad_norm.item()), self.device) / self.world_size
@@ -579,6 +650,12 @@ class OnPolicyTrainer:
                         payload["train/mean_weight"] = avg["mean_weight"]
                     if self.caption_dropout_prob > 0.0:
                         payload["train/caption_dropped_frac"] = avg["caption_dropped"]
+                    if self.anchor_beta > 0.0:
+                        # loss_anchor is 0 at init (LoRA B=0 => the adapter is the identity);
+                        # it growing means the draft is drifting away from the frozen base.
+                        payload["train/loss_repair"] = avg["loss_repair"]
+                        payload["train/loss_anchor"] = avg["loss_anchor"]
+                        payload["train/anchor_beta"] = self.anchor_beta
                     wandb.log(payload, step=self.train_steps)
                 running = {key: 0.0 for key in running}
                 log_steps = 0
