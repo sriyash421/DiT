@@ -1,7 +1,8 @@
 _target_: datasets.build_clevr_dataset
 datasets:
   - name: base
-    path: /gscratch/socialrl/sriyash/clevr_g6_tiny/data.zarr
+    # G6_DATA: the zarr the trainer reads. Fetch it from the HF dataset repo (see the runbook).
+    path: ${oc.env:G6_DATA,/gscratch/socialrl/sriyash/clevr_g6_tiny/data.zarr}
     sampling_ratio: 1.0
     max_dataset_size: null
 split: train

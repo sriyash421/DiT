@@ -109,15 +109,48 @@ sha256 of the ordered captions, first 16 hex
   val    432cefd7055dc827
 ```
 
-Then point the config at what you fetched:
+### Point the configs at what you fetched — with env vars, not edits
 
-| config key | set to |
-|---|---|
-| `dataset.datasets[0].path` | your `data.zarr` |
-| `model.base_ckpt` | your `base_undertrained_step0000250.pt` |
-| `results_dir` | a path with ~50 GB free |
-| `trainer.rollout.storage_dir` | fast scratch, ~5 GB; or set `$ROLLOUT_DIR` |
-| `verifier.probe_path` | see §3 |
+Every cluster-specific path is `${oc.env:VAR,<hyak default>}`, so **do not edit the config files**;
+export these instead. Editing them creates a diff that makes this arm hard to compare against the
+control, which is the whole point of the run.
+
+**The filesystems differ between clusters.** hyak's scratch is `/gscratch/scrubbed/sriyash`;
+tillicum's is **`/gpfs/scrubbed/sriyash`**. Every default below is a hyak path and will not exist
+here, so all five must be set.
+
+```bash
+export G6_DATA=/gpfs/scrubbed/sriyash/artifacts/data.zarr
+export G6_BASE_CKPT=/gpfs/scrubbed/sriyash/artifacts/checkpoints/base_undertrained_step0000250.pt
+export G6_PROBE=/gpfs/scrubbed/sriyash/artifacts/clevr_shape_probe_g6.pt
+export G6_RESULTS=/gpfs/scrubbed/sriyash/runs/onpolicy        # ~50 GB
+export ROLLOUT_DIR=/gpfs/scrubbed/sriyash/rollouts/g6_reject  # fast scratch, ~5 GB
+```
+
+| var | what it points at | if it is wrong |
+|---|---|---|
+| `G6_DATA` | the zarr the trainer reads | trains on the wrong images, silently |
+| `G6_BASE_CKPT` | the frozen base the LoRA sits on | **silently trains on raw OmniGen-v1** — the single most dangerous mistake here |
+| `G6_PROBE` | the retrained CLEVR shape probe | every score is wrong; the shipped probe reads cylinders as cubes |
+| `G6_RESULTS` | checkpoints and logs | a full filesystem kills the run mid-eval |
+| `ROLLOUT_DIR` | rollout buffers | slow scratch makes generation the bottleneck |
+
+Confirm they resolved before launching — this prints the paths hydra will actually use:
+
+```bash
+python -c "
+from hydra import compose, initialize_config_dir
+with initialize_config_dir(config_dir='$PWD/configs', version_base=None):
+    c = compose(config_name='train_on_policy_g6_reject')
+for k, v in (('zarr', c.dataset.datasets[0].path), ('base_ckpt', c.model.base_ckpt),
+             ('results', c.results_dir), ('probe', c.verifier.probe_path),
+             ('rollouts', c.trainer.rollout.storage_dir)):
+    print(f'{k:<10}', v)
+"
+```
+
+If any line still says `/gscratch`, the env var did not take and you are about to run against paths
+that do not exist on this cluster.
 
 ## 3. The verifier
 

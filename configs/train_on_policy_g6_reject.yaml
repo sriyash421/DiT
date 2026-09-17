@@ -23,7 +23,9 @@ hydra:
 # in via model.base_ckpt, which strict-loads it as the frozen LoRA base.
 ckpt: null
 start_step: 0
-results_dir: /gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy   # NOT /gscratch/socialrl (97% full)
+# G6_RESULTS: checkpoints and logs land here; needs ~50GB. Keep it off a quota-tight filesystem
+# -- this project has already lost a run to a disk quota error mid-eval.
+results_dir: ${oc.env:G6_RESULTS,/gscratch/scrubbed/sriyash/omni-clevr-g6-on-policy}
 experiment_name: on_policy_g6_reject
 
 dataset:
@@ -32,7 +34,10 @@ dataset:
 model:
   _target_: models.omni_gen.OmniGenModel
   model_name_or_path: Shitao/OmniGen-v1
-  base_ckpt: /gscratch/socialrl/sriyash/OmniGen-clevr-g6-tiny2k/clevr_g6_tiny2k/checkpoints/0000250.pt
+  # G6_BASE_CKPT: the frozen base the LoRA trains on top of, 22.8GB, from the HF model repo.
+  # It goes in HERE, not through `ckpt` -- it is a full-FT .pt with no lora_ keys, so loading it
+  # as `ckpt` under lora_finetune=true would match nothing and silently leave raw OmniGen-v1.
+  base_ckpt: ${oc.env:G6_BASE_CKPT,/gscratch/socialrl/sriyash/OmniGen-clevr-g6-tiny2k/clevr_g6_tiny2k/checkpoints/0000250.pt}
   image_height: 256
   image_width: 256
   vae: null
@@ -124,7 +129,7 @@ trainer:
     drop_last: true
   eval:
     use_clevr_detector_scorer: true
-    detector_probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt
+    detector_probe_path: ${oc.env:G6_PROBE,/gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt}
     # Forwarded so the eval scorer scores placement exactly like the rollout verifier; without these
     # eval/distance_step_* would stay position-blind.
     detector_cell_centres: [[37, 194], [110, 194], [182, 194], [74, 58], [146, 58], [219, 58]]

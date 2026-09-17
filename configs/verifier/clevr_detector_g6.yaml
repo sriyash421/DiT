@@ -6,7 +6,8 @@
 # rollouts would train on an actively wrong signal.
 _target_: verifiers.detector_clevr.ClevrDetectorVerifier
 device: cuda
-probe_path: /gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt
+# G6_PROBE: the CLEVR shape probe retrained on this dataset's crops.
+probe_path: ${oc.env:G6_PROBE,/gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt}
 use_probe: true
 use_owl: false
 box_threshold: 0.25
