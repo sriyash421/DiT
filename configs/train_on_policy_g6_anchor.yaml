@@ -123,6 +123,10 @@ trainer:
     detector_cell_tol: 30.0
     caption_index: 42
     batch_size: 32
+    # Generation chunk for adaptive_eval. The default 32 OOM'd at 4 ranks: the three other
+    # ranks each hold ~2.8GB of NCCL buffers on GPU 0, leaving rank 0 only ~35 of 44GB, and
+    # a 32-prompt chain with prior attempts in context does not fit in what is left.
+    gen_batch: 8
     seed: 0
     steps: 4                    # logs eval/distance_step_0..3 -- the sequential curve
 wandb:
