@@ -91,7 +91,14 @@ Training reads a **zarr**, not the loose PNGs. It is published in the same datas
 hf download sriyash421/clevr-g6-tiny-v0 --repo-type dataset \
     --include 'data.zarr/*' --local-dir ./artifacts
 # -> ./artifacts/data.zarr
+
+# 4) the verifier's shape probe (523 KB) -- see §3 for why the stock one will not do
+hf download sriyash421/clevr-g6-tiny-v0 --repo-type dataset \
+    verifier/clevr_shape_probe_g6.pt --local-dir ./artifacts
+# -> ./artifacts/verifier/clevr_shape_probe_g6.pt
 ```
+
+Everything the run needs is in those two repos; nothing has to be copied off hyak.
 
 The loose PNGs under `images/` are for inspection and for pinning the eval set; they are **not**
 what training or evaluation reads. If you ever need to rebuild the zarr from scratch,
@@ -122,7 +129,7 @@ here, so all five must be set.
 ```bash
 export G6_DATA=/gpfs/scrubbed/sriyash/artifacts/data.zarr
 export G6_BASE_CKPT=/gpfs/scrubbed/sriyash/artifacts/checkpoints/base_undertrained_step0000250.pt
-export G6_PROBE=/gpfs/scrubbed/sriyash/artifacts/clevr_shape_probe_g6.pt
+export G6_PROBE=/gpfs/scrubbed/sriyash/artifacts/verifier/clevr_shape_probe_g6.pt
 export G6_RESULTS=/gpfs/scrubbed/sriyash/runs/onpolicy        # ~50 GB
 export ROLLOUT_DIR=/gpfs/scrubbed/sriyash/rollouts/g6_reject  # fast scratch, ~5 GB
 ```
@@ -157,11 +164,12 @@ that do not exist on this cluster.
 VLM-free: Grounding DINO for boxes + a CLIP shape probe + HSV colour, each box snapped to its
 nearest of 6 fixed grid cells (30 px tolerance). Config: `configs/verifier/clevr_detector_g6.yaml`.
 
-It needs `clevr_shape_probe_g6.pt` (523 KB), which is **not** published. Copy it from hyak
-(`/gscratch/scrubbed/sriyash/models/clevr_shape_probe_g6.pt`) or retrain with
-`repro/data/retrain_shape_probe_g6.py`. The stock probe reads cylinders as cubes at this object size
-(shape 0.873 vs 1.000 on held-out crops), so the retrained one is required — using the stock probe
-silently corrupts every critique and every score.
+It needs `clevr_shape_probe_g6.pt` (523 KB), fetched in §2 from the dataset repo under
+`verifier/`. The stock CLEVR probe reads cylinders as cubes at this object size (shape 0.873 vs
+1.000 on held-out crops), so the retrained one is **required** — with the stock probe every critique
+and every score is wrong, and wrong in a way that still looks plausible. `G6_PROBE` must point at
+the fetched file. (`repro/data/retrain_shape_probe_g6.py` can rebuild it, but there is no reason
+to.)
 
 Sanity check before a long run: the verifier should call ~97.5% of *real* renders exact. If it is
 far off, the probe or the cell centres are wrong.
