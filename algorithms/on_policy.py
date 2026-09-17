@@ -52,11 +52,20 @@ class RolloutCollector:
     the GT path; the model turns that history into a loss at update time.
     """
 
-    def __init__(self, model, sampler_cfg, verifier, rollout_length=1, verify_last=False):
+    def __init__(self, model, sampler_cfg, verifier, rollout_length=1, verify_last=False,
+                 max_no_update_frac=None, max_oversample=8.0):
         self.model = model
         self.sampler_cfg = sampler_cfg
         self.verifier = verifier
         self.rollout_length = max(1, int(rollout_length))
+        # Cap on the share of DEGENERATE chains (first attempt already exact, so every later row is
+        # conditioned on "no update" and teaches copy-the-image). None disables rejection entirely
+        # and reproduces the original collector. max_oversample bounds the extra generation, which
+        # the control run's own rates say reaches ~6x by the end of training at a 25% cap.
+        self.max_no_update_frac = (None if max_no_update_frac is None
+                                   else float(max_no_update_frac))
+        self.max_oversample = float(max_oversample)
+        self.last_rollout_composition = {}
         # The final attempt is normally left ungraded because nothing consumes its critique.
         # Grading it costs one extra verifier call per chain and yields the per-position exact
         # rates, which are the headline diagnostic for anchored training.
@@ -98,7 +107,25 @@ class RolloutCollector:
             data_sampler.set_epoch(current_epoch)
         iterator = iter(loader)
 
-        while base_attempted < sample_count:
+        # Rejection sampling over CHAINS. A chain is "degenerate" when its first attempt was
+        # already exact: every later row in it is conditioned on "no update" and teaches
+        # copy-the-image, not repair. Keep sampling until the buffer is FULL of `sample_count`
+        # chains with at most `max_degenerate` of them degenerate.
+        max_degenerate = (int(round(sample_count * self.max_no_update_frac))
+                          if self.max_no_update_frac is not None else None)
+        gen_budget = (int(sample_count * self.max_oversample)
+                      if max_degenerate is not None else sample_count)
+        accepted_chains = 0
+        degenerate_accepted = 0
+        degenerate_rejected = 0
+        generated_chains = 0
+        written = 0
+
+        while accepted_chains < sample_count:
+            if generated_chains >= gen_budget:
+                # Budget spent. Take what we have rather than spin: the realised composition is
+                # logged, so a run that could not hit its cap is visible instead of silent.
+                break
             try:
                 batch = next(iterator)
             except StopIteration:
@@ -107,8 +134,6 @@ class RolloutCollector:
                     data_sampler.set_epoch(current_epoch)
                 iterator = iter(loader)
                 batch = next(iterator)
-            remaining = int(sample_count) - base_attempted
-            batch = _slice_batch(batch, min(remaining, int(batch["image"].shape[0])))
             batch_size = int(batch["image"].shape[0])
             if batch_size == 0:
                 continue
@@ -117,34 +142,29 @@ class RolloutCollector:
             gt_images = [normalized_tensor_to_pil(image) for image in batch["image"]]
             gt_paths = []
             for local_idx in range(batch_size):
-                gt_path = gt_dir / f"{base_attempted + local_idx:06d}.png"
+                gt_path = gt_dir / f"{generated_chains + local_idx:06d}.png"
                 gt_images[local_idx].save(gt_path)
                 gt_paths.append(str(gt_path))
 
             feedback_history = [[] for _ in range(batch_size)]
             attempt_image_history = [[] for _ in range(batch_size)]
             attempt_path_history = [[] for _ in range(batch_size)]
-            # One x_T per episode, drawn on the first step and reused for every later step: the only
-            # thing that changes between attempt_t and attempt_t+1 is the feedback, so the model
-            # learns to EDIT the image rather than resample a fresh one (fresh noise would make
-            # feedback indistinguishable from best-of-N).
+            # Records are buffered per chain: acceptance is only decidable once the first attempt
+            # has been graded, and a chain is accepted or rejected whole.
+            pending = [[] for _ in range(batch_size)]
+            degenerate = [False] * batch_size
             episode_noise = None
 
             for step_idx in range(self.rollout_length):
-                step_seed = None if seed is None else int(seed) + base_attempted
+                step_seed = None if seed is None else int(seed) + generated_chains
                 attempt_images, attempt_latents = self._generate(
                     captions, feedback_history, attempt_image_history, attempt_path_history,
                     step_seed, init_latents=episode_noise,
                 )
                 if episode_noise is None:
-                    # generate() hands back ONE CPU TENSOR PER ITEM (it persists them per record),
-                    # but init_latents is a batched tensor -- stack before feeding it back.
                     episode_noise = torch.stack([latent.detach() for latent in attempt_latents])
                 sampled_attempts += batch_size
 
-                # Every item runs the full rollout_length -- a chain is never cut short, so the
-                # model also sees "already correct, no update" transitions and learns to hold them.
-                # The last attempt needs no feedback (nothing would consume it).
                 is_last = step_idx + 1 >= self.rollout_length
                 results = None
                 if not is_last or self.verify_last:
@@ -153,27 +173,25 @@ class RolloutCollector:
                         [list(history) for history in feedback_history],
                     )
                     token_count += sum(int(result.token_count) for result in results)
-                    failed += sum(1 for result in results if not result.ok)   # verifier health only
-                    # per-position exact rate: position 0 is the draft, later positions the repairs.
-                    # Under anchoring these two must diverge -- draft flat, repair rising.
-                    for result in results:
+                    failed += sum(1 for result in results if not result.ok)
+                    for local_idx, result in enumerate(results):
                         ok = (result.ok and
                               str(result.feedback).strip().lower().rstrip(".") == "no update")
+                        # Rates are logged over everything GENERATED, not everything accepted, so
+                        # they stay an honest measure of the policy rather than of the filter.
                         exact_by_pos.setdefault(step_idx, []).append(1.0 if ok else 0.0)
+                        if step_idx == 0:
+                            degenerate[local_idx] = bool(ok)
 
                 for idx in range(batch_size):
-                    # a verifier error just yields empty feedback; the chain continues either way.
-                    # The final attempt's critique is discarded even when graded: nothing consumes it.
                     feedback = ("" if is_last else
                                 (results[idx].feedback if results is not None and results[idx].ok else ""))
-                    record_id = len(records)
-                    attempt_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.png"
+                    attempt_path = attempts_dir / f"{written:06d}_step_{step_idx:02d}.png"
                     attempt_images[idx].save(attempt_path)
-                    # x_T that produced this attempt (~8KB fp16); training reuses it as the
-                    # flow-matching noise so the learned path matches inference.
-                    latent_path = attempts_dir / f"{record_id:06d}_step_{step_idx:02d}.pt"
+                    latent_path = attempts_dir / f"{written:06d}_step_{step_idx:02d}.pt"
                     torch.save(attempt_latents[idx].to(torch.float16), latent_path)
-                    records.append({
+                    written += 1
+                    pending[idx].append({
                         "gt_path": gt_paths[idx],
                         "caption": captions[idx],
                         "feedback_history": list(feedback_history[idx]),
@@ -187,9 +205,42 @@ class RolloutCollector:
                         attempt_image_history[idx].append(attempt_images[idx])
                         attempt_path_history[idx].append(str(attempt_path))
 
-            base_attempted += batch_size
+            for idx in range(batch_size):
+                if accepted_chains >= sample_count:
+                    reject = True
+                elif degenerate[idx] and max_degenerate is not None \
+                        and degenerate_accepted >= max_degenerate:
+                    reject = True
+                    degenerate_rejected += 1
+                else:
+                    reject = False
+                if reject:
+                    # Drop the whole chain AND its files: at high oversampling the step directory
+                    # would otherwise grow with the rejection factor.
+                    for rec in pending[idx]:
+                        for key in ("attempt_path", "latent_path"):
+                            try:
+                                Path(rec[key]).unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    continue
+                records.extend(pending[idx])
+                accepted_chains += 1
+                degenerate_accepted += int(degenerate[idx])
+
+            generated_chains += batch_size
+            base_attempted = accepted_chains
             if progress is not None:
                 progress.update(batch_size)
+
+        self.last_rollout_composition = {
+            "accepted_chains": int(accepted_chains),
+            "generated_chains": int(generated_chains),
+            "degenerate_accepted": int(degenerate_accepted),
+            "degenerate_rejected": int(degenerate_rejected),
+            "oversample": float(generated_chains / max(1, accepted_chains)),
+            "degenerate_frac": float(degenerate_accepted / max(1, accepted_chains)),
+        }
 
         stats = {
             "attempted": int(sampled_attempts),
@@ -382,6 +433,8 @@ class OnPolicyTrainer:
             verifier=verifier,
             rollout_length=rollout.length,
             verify_last=self.verify_last,
+            max_no_update_frac=getattr(rollout, "max_no_update_frac", None),
+            max_oversample=float(getattr(rollout, "max_oversample", 8.0)),
         )
 
         self.params = model.trainable_parameters()
