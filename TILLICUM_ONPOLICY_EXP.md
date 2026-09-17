@@ -84,12 +84,22 @@ hf download sriyash421/onpolicy-distill-v0 \
     base_undertrained_step0000250.pt --local-dir ./artifacts/checkpoints
 ```
 
-**The zarr is not published.** Training reads a zarr, not loose PNGs. Two options:
+Training reads a **zarr**, not the loose PNGs. It is published in the same dataset repo:
 
-- *Preferred:* copy `clevr_g6_tiny/data.zarr` (264 MB) from hyak at
-  `/gscratch/socialrl/sriyash/clevr_g6_tiny/data.zarr`.
-- *Otherwise:* rebuild it with `repro/data/build_g6_tiny_zarr.py`, which needs the 10,000 raw CLEVR
-  renders — far more work. Copy the zarr.
+```bash
+# 3) the zarr the trainer actually reads (100 train / 2,000 held-out)
+hf download sriyash421/clevr-g6-tiny-v0 --repo-type dataset \
+    --include 'data.zarr/*' --local-dir ./artifacts
+# -> ./artifacts/data.zarr
+```
+
+The loose PNGs under `images/` are for inspection and for pinning the eval set; they are **not**
+what training or evaluation reads. If you ever need to rebuild the zarr from scratch,
+`repro/data/build_g6_tiny_zarr.py` does it, but it needs the 10,000 raw CLEVR renders, which are
+not published — download the zarr instead.
+
+Note the zarr must be written by **zarr 2.x**. An environment with zarr 3.x can read it but cannot
+write the v2 schema, which is why the builder and the trainer historically needed different envs.
 
 Verify the eval set is the right one before trusting any number:
 
